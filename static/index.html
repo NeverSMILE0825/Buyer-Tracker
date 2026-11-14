@@ -115,12 +115,12 @@
           <p id="visibleCount" class="summary"></p>
         </div>
         <div id="warnings" class="warnings" hidden></div>
-        <p id="ethNote" class="note" hidden>Amount (ETH) is this wallet’s net ETH plus WETH for that transaction. Every token row from the same hash shares it, so don’t add the column down the table. Count is the number of transactions that moved that token in the selected range.</p>
+        <p id="ethNote" class="note" hidden title="Amount (ETH) is this wallet’s net ETH plus WETH for that transaction. Every token row from the same hash shares it, so don’t add the column down the table. Count is the number of transactions that moved that token in the selected range.">Amount (ETH) is net ETH plus WETH for the whole transaction, repeated on each token row. Count is distinct transactions for that token in this range.</p>
 
         <div class="tools">
           <label class="field filter-field">
-            <span>Filter rows</span>
-            <input id="filter" type="search" placeholder="Uniswap V3, Tether USD (USDT), USDC (USDC)…" autocomplete="off">
+            <span class="sr">Filter rows</span>
+            <input id="filter" type="search" placeholder="Filter: Uniswap V3, Tether USD (USDT), USDC…" autocomplete="off" aria-label="Filter rows">
           </label>
           <div id="chipRow" class="chips" aria-label="Quick filters"></div>
           <div class="tool-toggles">
@@ -140,6 +140,29 @@
           </div>
           <p id="emptyResults" class="empty-results">Track a wallet to see its ERC-20 transfers.</p>
         </div>
+        <nav id="pager" class="pager" aria-label="Transfer pages" hidden>
+          <label class="pager-size">
+            <span>Rows per page</span>
+            <select id="pageSizeSelect" aria-label="Rows per page">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="250">250</option>
+            </select>
+          </label>
+          <p id="pageRange" class="pager-range"></p>
+          <div class="pager-nav">
+            <button type="button" id="pageFirst">First</button>
+            <button type="button" id="pagePrev">Prev</button>
+            <div id="pageNumbers" class="page-numbers"></div>
+            <button type="button" id="pageNext">Next</button>
+            <button type="button" id="pageLast">Last</button>
+          </div>
+          <form id="pageJump" class="pager-jump">
+            <input id="pageJumpInput" inputmode="numeric" autocomplete="off" placeholder="Page" aria-label="Go to page">
+            <span id="pageCount"></span>
+          </form>
+        </nav>
       </section>
     </main>
   </div>

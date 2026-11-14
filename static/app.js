@@ -47,8 +47,11 @@ const state = {
   chips: new Set(),
   hideZero: false,
   ageMode: "relative",
+  page: 1,
+  pageSize: 50,
   running: false,
 };
+const PAGE_SIZES = [25, 50, 100, 250];
 
 const $ = (id) => document.getElementById(id);
 const addressInput = $("address");
@@ -391,6 +394,87 @@ function compare(a, b) {
   return b.block - a.block || a.seq - b.seq;
 }
 
+function pageWindow() {
+  const total = state.view.length;
+  const size = state.pageSize;
+  const pages = Math.max(1, Math.ceil(total / size) || 1);
+  if (state.page > pages) state.page = pages;
+  if (state.page < 1) state.page = 1;
+  const start = total === 0 ? 0 : (state.page - 1) * size;
+  const end = Math.min(total, start + size);
+  return { start, end, total, pages, size };
+}
+
+function pageList(pages, current) {
+  const wanted = new Set([1, pages, current - 2, current - 1, current, current + 1, current + 2]);
+  const numbers = [...wanted].filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b);
+  const items = [];
+  let previous = 0;
+  for (const number of numbers) {
+    if (number - previous > 1) items.push("…");
+    items.push(number);
+    previous = number;
+  }
+  return items;
+}
+
+function renderPager() {
+  const pager = $("pager");
+  const { start, end, total, pages } = pageWindow();
+  pager.hidden = !state.loaded;
+  $("pageRange").textContent = total
+    ? `${(start + 1).toLocaleString()}–${end.toLocaleString()} of ${total.toLocaleString()}`
+    : "0 rows";
+  $("pageCount").textContent = total ? `of ${pages.toLocaleString()}` : "";
+  $("pageFirst").disabled = state.page <= 1 || total === 0;
+  $("pagePrev").disabled = state.page <= 1 || total === 0;
+  $("pageNext").disabled = state.page >= pages || total === 0;
+  $("pageLast").disabled = state.page >= pages || total === 0;
+  const box = $("pageNumbers");
+  box.replaceChildren();
+  if (!total) return;
+  for (const item of pageList(pages, state.page)) {
+    if (item === "…") {
+      const gap = document.createElement("span");
+      gap.className = "page-ellipsis";
+      gap.textContent = "…";
+      box.append(gap);
+      continue;
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = item.toLocaleString();
+    button.setAttribute("aria-label", `Page ${item}`);
+    if (item === state.page) button.setAttribute("aria-current", "page");
+    button.addEventListener("click", () => setPage(item));
+    box.append(button);
+  }
+}
+
+function setPage(page) {
+  const { pages } = pageWindow();
+  const next = Math.min(pages, Math.max(1, page));
+  if (next === state.page) return;
+  state.page = next;
+  tableWrap.scrollTop = 0;
+  sliceStart = -1;
+  paint(true);
+  renderPager();
+}
+
+function setPageSize(size) {
+  if (!PAGE_SIZES.includes(size)) return;
+  const { start } = pageWindow();
+  state.pageSize = size;
+  state.page = Math.floor(start / size) + 1;
+  $("pageSizeSelect").value = String(size);
+  tableWrap.scrollTop = 0;
+  sliceStart = -1;
+  paint(true);
+  renderPager();
+  saveForm();
+}
+
 function applyView() {
   const query = state.filter.trim().toLowerCase();
   const chips = CHIPS.filter((chip) => state.chips.has(chip.id));
@@ -404,8 +488,10 @@ function applyView() {
   }
   view.sort((a, b) => compare(state.rows[a], state.rows[b]));
   state.view = view;
+  state.page = 1;
   renderSummary();
   renderHead();
+  renderPager();
   tableWrap.scrollTop = 0;
   sliceStart = -1;
   paint(true);
@@ -460,14 +546,15 @@ function renderRow(row) {
 }
 
 function paint(force) {
-  const view = state.view;
-  spacer.style.height = `${view.length * ROW_H}px`;
+  const { start: pageStart, end: pageEnd } = pageWindow();
+  const count = pageEnd - pageStart;
+  spacer.style.height = `${count * ROW_H}px`;
   const headerH = thead.offsetHeight || 42;
   const startY = tableWrap.scrollTop;
   const endY = startY + tableWrap.clientHeight - headerH;
   const start = Math.max(0, Math.floor(startY / ROW_H) - 8);
-  const end = Math.min(view.length, Math.ceil(Math.max(endY, ROW_H) / ROW_H) + 8);
-  if (view.length === 0) {
+  const end = Math.min(count, Math.ceil(Math.max(endY, ROW_H) / ROW_H) + 8);
+  if (count === 0) {
     windowEl.innerHTML = "";
     emptyResults.hidden = false;
     emptyResults.textContent = state.loaded && state.rows.length
@@ -482,7 +569,9 @@ function paint(force) {
   sliceStart = start;
   sliceEnd = end;
   const html = [];
-  for (let index = start; index < end; index += 1) html.push(renderRow(state.rows[view[index]]));
+  for (let index = start; index < end; index += 1) {
+    html.push(renderRow(state.rows[state.view[pageStart + index]]));
+  }
   windowEl.style.transform = `translateY(${start * ROW_H}px)`;
   windowEl.innerHTML = html.join("");
 }
@@ -527,6 +616,7 @@ function showResults(payload) {
   state.rows = payload.rows || [];
   state.meta = payload.meta || null;
   state.loaded = true;
+  state.page = 1;
   for (const row of state.rows) buildSearch(row);
   tableWrap.scrollTop = 0;
   applyView();
@@ -665,6 +755,7 @@ function saveForm() {
       endBlock: $("endBlock").value,
       ageMode: state.ageMode,
       hideZero: state.hideZero,
+      pageSize: state.pageSize,
     }));
   } catch { /* private mode */ }
 }
@@ -682,6 +773,9 @@ function restoreForm() {
   if (saved?.endBlock) $("endBlock").value = saved.endBlock;
   state.hideZero = Boolean(saved?.hideZero);
   $("hideZero").checked = state.hideZero;
+  const savedSize = Number(saved?.pageSize);
+  state.pageSize = PAGE_SIZES.includes(savedSize) ? savedSize : 50;
+  $("pageSizeSelect").value = String(state.pageSize);
   setAgeMode(saved?.ageMode === "absolute" ? "absolute" : "relative");
   setMode(saved?.mode === "block" ? "block" : "time", false);
 }
@@ -728,6 +822,19 @@ function bind() {
       state.filter = filterInput.value;
       applyView();
     }, 40);
+  });
+  $("pageFirst").addEventListener("click", () => setPage(1));
+  $("pagePrev").addEventListener("click", () => setPage(state.page - 1));
+  $("pageNext").addEventListener("click", () => setPage(state.page + 1));
+  $("pageLast").addEventListener("click", () => setPage(pageWindow().pages));
+  $("pageSizeSelect").addEventListener("change", () => setPageSize(Number($("pageSizeSelect").value)));
+  $("pageJump").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = $("pageJumpInput");
+    if (!/^\d+$/.test(input.value.trim())) return;
+    const page = Number(input.value);
+    setPage(page);
+    input.value = "";
   });
   $("hideZero").addEventListener("change", () => {
     state.hideZero = $("hideZero").checked;
