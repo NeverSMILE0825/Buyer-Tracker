@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 from tracker.analyze import build_rows
 from tracker.checksum import normalize_address
 from tracker.db import db
-from tracker.etherscan import EtherscanClient, EtherscanError
+from tracker.etherscan import EtherscanError, KeyPool
 from tracker.formatutil import clean_label
 
 GENESIS_TS = 1_438_269_973
@@ -36,11 +36,14 @@ def block_fraction(reached: int | None, start: int, end: int) -> float:
 class _FetchProgress:
     """Turn block-cursor updates into one monotonic fraction of the whole fetch."""
 
-    def __init__(self, progress: Progress, started: float) -> None:
+    def __init__(self, progress: Progress, started: float, keys: int) -> None:
         self._progress = progress
         self._started = started
+        self._lock = asyncio.Lock()
+        self.keys = keys
         self.fraction = 0.0
         self.token_rows = 0
+        self.token_blocks = 0
         self.tx_rows = 0
         self.internal_rows = 0
         self.tx_fraction = 0.0
@@ -51,40 +54,46 @@ class _FetchProgress:
         self.fraction = fraction
         payload = {key: value for key, value in extra.items() if value is not None}
         payload["elapsed_ms"] = int((time.perf_counter() - self._started) * 1000)
+        if self.keys > 1:
+            payload["keys"] = self.keys
         await self._progress(message, round(fraction, 4), payload)
 
-    async def token(self, rows: int, reached: int, start: int, end: int) -> None:
-        self.token_rows = max(self.token_rows, rows)
-        phase = block_fraction(reached, start, end)
-        await self.send(
-            "Reading token transfers",
-            RESOLVE_FRACTION + TOKEN_FRACTION * phase,
-            rows=self.token_rows,
-            block=min(end, max(start, reached)),
-            start_block=start,
-            end_block=end,
-        )
+    async def token(self, rows: int, blocks_done: int, blocks_total: int, start: int, end: int) -> None:
+        async with self._lock:
+            self.token_rows = max(self.token_rows, rows)
+            self.token_blocks = max(self.token_blocks, blocks_done)
+            phase = 1.0 if blocks_total <= 0 else min(1.0, self.token_blocks / blocks_total)
+            await self.send(
+                "Reading token transfers",
+                RESOLVE_FRACTION + TOKEN_FRACTION * phase,
+                rows=self.token_rows,
+                blocks_done=self.token_blocks,
+                blocks_total=blocks_total,
+                start_block=start,
+                end_block=end,
+            )
 
-    async def eth(self, kind: str, rows: int, reached: int, start: int, end: int) -> None:
-        phase = block_fraction(reached, start, end)
-        if kind == "tx":
-            self.tx_rows = max(self.tx_rows, rows)
-            self.tx_fraction = max(self.tx_fraction, phase)
-        else:
-            self.internal_rows = max(self.internal_rows, rows)
-            self.internal_fraction = max(self.internal_fraction, phase)
-        combined = (self.tx_fraction + self.internal_fraction) / 2
-        await self.send(
-            "Reading ETH and internal transactions",
-            RESOLVE_FRACTION + TOKEN_FRACTION + ETH_FRACTION * combined,
-            detail=f"ETH {self.tx_rows:,} rows · internal {self.internal_rows:,} rows",
-            start_block=start,
-            end_block=end,
-        )
+    async def eth(self, kind: str, rows: int, blocks_done: int, blocks_total: int, start: int, end: int) -> None:
+        async with self._lock:
+            phase = 1.0 if blocks_total <= 0 else min(1.0, max(0, blocks_done) / blocks_total)
+            if kind == "tx":
+                self.tx_rows = max(self.tx_rows, rows)
+                self.tx_fraction = max(self.tx_fraction, phase)
+            else:
+                self.internal_rows = max(self.internal_rows, rows)
+                self.internal_fraction = max(self.internal_fraction, phase)
+            combined = (self.tx_fraction + self.internal_fraction) / 2
+            await self.send(
+                "Reading ETH and internal transactions",
+                RESOLVE_FRACTION + TOKEN_FRACTION + ETH_FRACTION * combined,
+                detail=f"ETH {self.tx_rows:,} rows · internal {self.internal_rows:,} rows",
+                start_block=start,
+                end_block=end,
+            )
 
 
 async def track(
-    client: EtherscanClient,
+    client: KeyPool,
     address: str,
     label: str,
     mode: str,
@@ -95,7 +104,7 @@ async def track(
     progress: Progress,
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    report = _FetchProgress(progress, started)
+    report = _FetchProgress(progress, started, client.key_count)
     wallet = normalize_address(address)
     saved = db.get_wallet(wallet)
     if saved is not None:
@@ -119,6 +128,7 @@ async def track(
             ["No blocks were mined in that time range."],
             client.calls,
             started,
+            client.key_count,
         )
     start, end, used_start, used_end = resolved
     await report.send(
@@ -129,8 +139,8 @@ async def track(
         end_block=end,
     )
 
-    async def token_progress(count: int, reached: int) -> None:
-        await report.token(count, reached, start, end)
+    async def token_progress(count: int, blocks_done: int, blocks_total: int) -> None:
+        await report.token(count, blocks_done, blocks_total, start, end)
 
     transfers, warnings = await client.fetch_account(
         "tokentx", wallet, start, end, token_progress
@@ -155,6 +165,7 @@ async def track(
             warnings,
             client.calls,
             started,
+            client.key_count,
         )
 
     blocks = [int(item["blockNumber"]) for item in transfers if item.get("blockNumber")]
@@ -168,11 +179,11 @@ async def track(
         end_block=span_end,
     )
 
-    async def tx_progress(count: int, reached: int) -> None:
-        await report.eth("tx", count, reached, span_start, span_end)
+    async def tx_progress(count: int, blocks_done: int, blocks_total: int) -> None:
+        await report.eth("tx", count, blocks_done, blocks_total, span_start, span_end)
 
-    async def internal_progress(count: int, reached: int) -> None:
-        await report.eth("internal", count, reached, span_start, span_end)
+    async def internal_progress(count: int, blocks_done: int, blocks_total: int) -> None:
+        await report.eth("internal", count, blocks_done, blocks_total, span_start, span_end)
 
     tx_task = client.fetch_account("txlist", wallet, span_start, span_end, tx_progress)
     internal_task = client.fetch_account(
@@ -212,11 +223,12 @@ async def track(
         warnings,
         client.calls,
         started,
+        client.key_count,
     )
 
 
 async def resolve_range(
-    client: EtherscanClient,
+    client: KeyPool,
     mode: str,
     start_time: int | None,
     end_time: int | None,
@@ -259,6 +271,7 @@ def _payload(
     warnings: list[str],
     api_calls: int,
     started: float,
+    keys: int = 1,
 ) -> dict[str, Any]:
     tokens = len({row["token_contract"].lower() for row in rows}) if rows else 0
     return {
@@ -274,14 +287,17 @@ def _payload(
             "transfers": len(rows),
             "tokens": tokens,
             "api_calls": api_calls,
+            "keys": keys,
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
             "warnings": [item for item in warnings if item],
         },
     }
 
 
-def require_api_key() -> str:
-    key = db.api_key()
-    if not key:
-        raise EtherscanError("Add an Etherscan API key in Settings first.")
-    return key
+def require_api_keys() -> list[str]:
+    keys = db.enabled_api_keys()
+    if keys:
+        return keys
+    if db.api_keys():
+        raise EtherscanError("Enable an Etherscan API key in the sidebar first.")
+    raise EtherscanError("Add an Etherscan API key in the sidebar first.")

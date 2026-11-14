@@ -118,7 +118,16 @@ button:focus-visible, input:focus-visible {
   align-items: stretch;
 }
 .wallet.selected .wallet-pick { border-color: var(--brass); background: rgba(224, 177, 90, 0.08); }
-.wallet-pick, .icon-btn, .ghost, .primary, .chips button, .age-toggle button, .th {
+.key-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+.key-row.off .wallet-name,
+.key-row.off .wallet-sub { color: var(--faint); }
+.key-toggle { padding: 0 10px; font-size: 12px; color: var(--muted); }
+.key-toggle[aria-pressed="true"] {
+  color: var(--brass-ink);
+  background: var(--brass);
+  border-color: var(--brass);
+}
+.wallet-pick, .icon-btn, .key-toggle, .ghost, .primary, .chips button, .age-toggle button, .th {
   border: 1px solid var(--line);
   background: var(--bg-raise);
   border-radius: 8px;

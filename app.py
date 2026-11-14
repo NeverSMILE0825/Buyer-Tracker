@@ -16,8 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from tracker.db import db
-from tracker.etherscan import EtherscanClient, EtherscanError
-from tracker.service import require_api_key, track
+from tracker.etherscan import EtherscanError, KeyPool
+from tracker.service import require_api_keys, track
 
 log = logging.getLogger("buyertracker")
 ROOT = Path(__file__).resolve().parent
@@ -54,6 +54,10 @@ class WalletIn(BaseModel):
 class ApiKeyIn(BaseModel):
     key: str
     label: str = ""
+
+
+class EnabledIn(BaseModel):
+    enabled: bool
 
 
 class SettingsIn(BaseModel):
@@ -123,9 +127,9 @@ def save_key(body: ApiKeyIn) -> dict[str, Any]:
     return db.save_api_key(body.key, body.label)
 
 
-@app.post("/api/keys/{key_id}/activate")
-def activate_key(key_id: int) -> dict[str, Any]:
-    saved = db.activate_api_key(key_id)
+@app.post("/api/keys/{key_id}/enabled")
+def set_key_enabled(key_id: int, body: EnabledIn) -> dict[str, Any]:
+    saved = db.set_api_key_enabled(key_id, body.enabled)
     if saved is None:
         raise HTTPException(status_code=404, detail="API key is not saved.")
     return saved
@@ -167,7 +171,7 @@ def put_settings(body: SettingsIn) -> dict[str, Any]:
 
 @app.get("/api/latest-block")
 async def latest_block(request: Request) -> dict[str, int]:
-    client = _client(request)
+    client = _pool(request)
     block = await client.latest_block()
     return {"block": block}
 
@@ -189,7 +193,7 @@ async def track_route(body: TrackIn, request: Request) -> StreamingResponse:
 
         async def run() -> None:
             try:
-                client = _client(request)
+                client = _pool(request)
                 payload = await track(
                     client,
                     body.address,
@@ -238,8 +242,8 @@ async def track_route(body: TrackIn, request: Request) -> StreamingResponse:
     )
 
 
-def _client(request: Request) -> EtherscanClient:
-    return EtherscanClient(require_api_key(), request.app.state.http, db.rate(), db.page_size())
+def _pool(request: Request) -> KeyPool:
+    return KeyPool(require_api_keys(), request.app.state.http, db.rate(), db.page_size())
 
 
 def _free_port(start: int = 8787, attempts: int = 20) -> int:

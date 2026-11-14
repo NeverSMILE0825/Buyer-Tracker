@@ -35,7 +35,7 @@
 
       <div class="side-head keys-head">
         <h2>API keys</h2>
-        <p>Save an Etherscan key and add a label later. A label is optional. The active key is the one sent to Etherscan.</p>
+        <p>Save an Etherscan key and add a label later. A label is optional. Turn a key on to use it. Enabled keys fetch at the same time.</p>
       </div>
       <label class="field">
         <span>Etherscan API key</span>
@@ -195,7 +195,7 @@
           <input id="pageSize" type="number" min="100" max="10000" step="100">
         </label>
       </div>
-      <p class="muted">Free tier is 3 calls/second and 1,000 records. A paid plan can use a larger page size, which makes busy wallets faster. Ethereum mainnet only.</p>
+      <p class="muted">Free tier is 3 calls/second and 1,000 records per key. Each enabled key keeps that rate, so three free keys can fetch at about 9 calls/second together. A paid plan can use a larger page size. Ethereum mainnet only.</p>
       <p id="settingsError" class="error" role="alert" hidden></p>
       <div class="dialog-actions">
         <button type="submit" class="primary" id="saveSettings">Save settings</button>

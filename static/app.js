@@ -238,19 +238,24 @@ function renderKeys() {
   $("keyEmpty").hidden = state.keys.length !== 0;
   for (const item of state.keys) {
     const row = document.createElement("li");
-    row.className = "wallet" + (item.active ? " selected" : "");
-    const pick = document.createElement("button");
-    pick.type = "button";
-    pick.className = "wallet-pick";
+    row.className = "wallet key-row" + (item.enabled ? " on" : " off");
+    const info = document.createElement("div");
+    info.className = "wallet-pick";
     const name = document.createElement("span");
     name.className = "wallet-name";
     name.textContent = item.label || item.hint;
     const sub = document.createElement("span");
     sub.className = "wallet-sub";
-    if (item.active) sub.textContent = item.label ? `${item.hint} · Active` : "Active";
-    else sub.textContent = item.label ? item.hint : "No label";
-    pick.append(name, sub);
-    pick.addEventListener("click", () => activateKey(item).catch((error) => {
+    sub.textContent = item.label ? item.hint : "No label";
+    info.append(name, sub);
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "key-toggle";
+    toggle.textContent = item.enabled ? "On" : "Off";
+    toggle.setAttribute("aria-pressed", String(Boolean(item.enabled)));
+    const label = item.label || item.hint;
+    toggle.setAttribute("aria-label", `${item.enabled ? "Disable" : "Enable"} ${label}`);
+    toggle.addEventListener("click", () => setKeyEnabled(item, !item.enabled).catch((error) => {
       $("keyStatus").textContent = error.message;
     }));
     const remove = document.createElement("button");
@@ -260,10 +265,18 @@ function renderKeys() {
     remove.addEventListener("click", () => removeKey(item).catch((error) => {
       $("keyStatus").textContent = error.message;
     }));
-    row.append(pick, remove);
+    row.append(info, toggle, remove);
     list.append(row);
   }
-  $("keyBanner").hidden = state.keys.some((item) => item.active);
+  const enabled = state.keys.some((item) => item.enabled);
+  const banner = $("keyBanner");
+  banner.hidden = enabled;
+  const note = banner.querySelector("p");
+  if (note) {
+    note.textContent = state.keys.length
+      ? "Turn on an API key before loading transfers. It stays on this computer."
+      : "Add an Etherscan API key before loading transfers. It stays on this computer.";
+  }
 }
 
 async function loadKeys() {
@@ -271,10 +284,14 @@ async function loadKeys() {
   renderKeys();
 }
 
-async function activateKey(item) {
-  if (item.active) return;
-  await getJSON(`/api/keys/${item.id}/activate`, { method: "POST" });
-  $("keyStatus").textContent = item.label ? `Using ${item.label}` : `Using ${item.hint}`;
+async function setKeyEnabled(item, enabled) {
+  await getJSON(`/api/keys/${item.id}/enabled`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+  const name = item.label || item.hint;
+  $("keyStatus").textContent = enabled ? `${name} on` : `${name} off`;
   await loadKeys();
 }
 
@@ -729,6 +746,7 @@ function finishProgress(meta) {
     bits.push(`Blocks ${Number(meta.start_block).toLocaleString()}–${Number(meta.end_block).toLocaleString()}`);
   }
   if (meta.api_calls != null) bits.push(`${Number(meta.api_calls).toLocaleString()} API calls`);
+  if (Number(meta.keys) > 1) bits.push(`${Number(meta.keys)} keys`);
   progressDetail.textContent = bits.join(" · ");
   setProgressBar(100, true);
   progress.hidden = false;
@@ -756,13 +774,16 @@ function renderProgress(message) {
   }
   progressText.textContent = message.message || "Loading…";
   const bits = [];
-  if (message.block != null && message.end_block != null) {
+  if (message.blocks_done != null && message.blocks_total != null) {
+    bits.push(`${Number(message.blocks_done).toLocaleString()} of ${Number(message.blocks_total).toLocaleString()} blocks`);
+  } else if (message.block != null && message.end_block != null) {
     bits.push(`Block ${Number(message.block).toLocaleString()} of ${Number(message.end_block).toLocaleString()}`);
   } else if (message.start_block != null && message.end_block != null) {
     bits.push(`Blocks ${Number(message.start_block).toLocaleString()}–${Number(message.end_block).toLocaleString()}`);
   }
   if (message.detail) bits.push(message.detail);
   else if (message.rows != null) bits.push(`${Number(message.rows).toLocaleString()} rows`);
+  if (Number(message.keys) > 1) bits.push(`${Number(message.keys)} keys`);
   progressDetail.textContent = bits.join(" · ");
   setProgressBar(Math.min(99, Math.floor(fraction * 100)), false);
 }

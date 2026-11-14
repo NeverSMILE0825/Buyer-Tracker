@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 import tempfile
@@ -8,7 +9,7 @@ from pathlib import Path
 from tracker.analyze import build_rows, decode_universal_router, _selector
 from tracker.checksum import to_checksum_address
 from tracker.db import Database
-from tracker.etherscan import QueryTimeout, classify, fetch_records, walk_records
+from tracker.etherscan import QueryTimeout, classify, fetch_records, parallel_walk, split_span, walk_records
 from tracker.service import block_fraction
 from tracker.formatutil import clean_label, format_amount, pretty_method, sort_units, token_amount
 from tracker.labels import V4_CAPABLE_ROUTERS
@@ -343,6 +344,53 @@ class FractionTests(unittest.TestCase):
         self.assertEqual(block_fraction(7, 7, 7), 1)
 
 
+class SplitTests(unittest.TestCase):
+    def test_split_span_covers_without_overlap(self):
+        spans = split_span(0, 9, 3)
+        self.assertEqual(spans, [(0, 3), (4, 6), (7, 9)])
+        self.assertEqual(split_span(5, 5, 3), [(5, 5)])
+        covered = []
+        for start, end in split_span(10, 20, 4):
+            covered.extend(range(start, end + 1))
+        self.assertEqual(covered, list(range(10, 21)))
+
+
+class ParallelWalkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lanes_return_every_row_once_and_overlap(self):
+        records = [{"blockNumber": str(block), "n": block} for block in range(20)]
+        in_flight = 0
+        peak = 0
+
+        async def fetch_page(start, end, page):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.02)
+            in_flight -= 1
+            matched = [row for row in records if start <= int(row["blockNumber"]) <= end]
+            offset = (page - 1) * 2
+            return matched[offset : offset + 2]
+
+        rows, warnings = await parallel_walk(fetch_page, 0, 19, 2, 10, 3)
+        self.assertEqual(sorted(row["n"] for row in rows), list(range(20)))
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(warnings, [])
+        self.assertGreaterEqual(peak, 2)
+
+    async def test_single_block_over_the_window_warns(self):
+        records = [{"blockNumber": "5", "n": index} for index in range(5)]
+
+        async def fetch_page(start, end, page):
+            matched = [row for row in records if start <= int(row["blockNumber"]) <= end]
+            offset = (page - 1) * 2
+            return matched[offset : offset + 2]
+
+        rows, warnings = await parallel_walk(fetch_page, 5, 5, 2, 2, 3)
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(warnings)
+        self.assertIn("Block 5", warnings[0])
+
+
 class ClientMessageTests(unittest.TestCase):
     def test_classify(self):
         self.assertEqual(classify("No transactions found", []), "empty")
@@ -367,29 +415,65 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(database.wallets(), [])
             database._conn.close()
 
-    def test_api_keys_are_saved_masked_and_one_is_active(self):
+    def test_api_keys_can_be_enabled_together(self):
         with tempfile.TemporaryDirectory() as folder:
             database = Database(Path(folder) / "tracker.db")
             first = database.save_api_key("FreeKey12345678", "")
             self.assertEqual(first["label"], "")
-            self.assertTrue(first["active"])
+            self.assertTrue(first["enabled"])
             self.assertEqual(first["hint"], "Free…5678")
             self.assertNotIn("key", first)
             second = database.save_api_key("PaidKey12345678", "Paid plan")
             listed = database.api_keys()
             self.assertEqual(len(listed), 2)
+            self.assertTrue(all(item["enabled"] for item in listed))
             self.assertNotIn("FreeKey12345678", json.dumps(listed))
             self.assertNotIn("PaidKey12345678", json.dumps(listed))
-            active = [item for item in listed if item["active"]]
-            self.assertEqual(active, [second])
-            self.assertEqual(database.api_key(), "PaidKey12345678")
-            switched = database.activate_api_key(first["id"])
-            self.assertTrue(switched["active"])
-            self.assertEqual(database.api_key(), "FreeKey12345678")
-            self.assertTrue(database.delete_api_key(first["id"]))
+            self.assertEqual(
+                set(database.enabled_api_keys()),
+                {"FreeKey12345678", "PaidKey12345678"},
+            )
+            disabled = database.set_api_key_enabled(second["id"], False)
+            self.assertIsNotNone(disabled)
+            self.assertFalse(disabled["enabled"])
+            self.assertEqual(database.enabled_api_keys(), ["FreeKey12345678"])
+            self.assertIsNone(database.set_api_key_enabled(999, True))
+            database.set_api_key_enabled(first["id"], False)
             self.assertEqual(database.api_key(), "")
+            self.assertTrue(database.delete_api_key(first["id"]))
             with self.assertRaises(ValueError):
                 database.save_api_key("short", "")
+            database._conn.close()
+
+    def test_saved_keys_stay_enabled_when_the_column_is_added(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tracker.db"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                """
+                CREATE TABLE api_keys (
+                    id INTEGER PRIMARY KEY,
+                    label TEXT NOT NULL DEFAULT '',
+                    key TEXT NOT NULL UNIQUE,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO api_keys (label, key, active, created_at, updated_at) VALUES ('', 'OldKey123456789', 1, 1, 1)"
+            )
+            conn.execute(
+                "INSERT INTO api_keys (label, key, active, created_at, updated_at) VALUES ('Spare', 'SpareKey1234567', 0, 1, 1)"
+            )
+            conn.commit()
+            conn.close()
+            database = Database(path)
+            self.assertEqual(
+                set(database.enabled_api_keys()),
+                {"OldKey123456789", "SpareKey1234567"},
+            )
             database._conn.close()
 
     def test_legacy_settings_key_is_migrated(self):
@@ -420,7 +504,6 @@ class ApiTests(unittest.TestCase):
         secret = "HttpTestKey123456"
         with TestClient(app) as client:
             created_id = None
-            previous = None
             try:
                 created = client.post("/api/wallets", json={"address": address, "label": ""})
                 self.assertEqual(created.status_code, 200)
@@ -431,20 +514,24 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(renamed.json()["label"], "Cold")
                 before = client.get("/api/keys")
                 self.assertEqual(before.status_code, 200)
-                previous = next((item["id"] for item in before.json() if item["active"]), None)
                 saved = client.post("/api/keys", json={"key": secret, "label": "CI"})
                 self.assertEqual(saved.status_code, 200)
                 created_id = saved.json()["id"]
                 self.assertEqual(saved.json()["label"], "CI")
+                self.assertTrue(saved.json()["enabled"])
                 self.assertNotIn(secret, saved.text)
+                turned_off = client.post(
+                    f"/api/keys/{created_id}/enabled",
+                    json={"enabled": False},
+                )
+                self.assertEqual(turned_off.status_code, 200)
+                self.assertFalse(turned_off.json()["enabled"])
                 keys = client.get("/api/keys")
                 self.assertNotIn(secret, keys.text)
                 self.assertIn("API keys", client.get("/").text)
                 removed = client.delete(f"/api/keys/{created_id}")
                 self.assertEqual(removed.status_code, 200)
                 created_id = None
-                if previous is not None:
-                    client.post(f"/api/keys/{previous}/activate")
                 if not db.api_key():
                     missing = client.post("/api/track", json={
                         "address": address,
@@ -460,8 +547,6 @@ class ApiTests(unittest.TestCase):
                 db.delete_wallet(address)
                 if created_id is not None:
                     db.delete_api_key(created_id)
-                if previous is not None:
-                    db.activate_api_key(previous)
 
 
 if __name__ == "__main__":

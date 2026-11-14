@@ -53,11 +53,13 @@ class Database:
                 label TEXT NOT NULL DEFAULT '',
                 key TEXT NOT NULL UNIQUE,
                 active INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
             """
         )
+        self._ensure_enabled_column()
         self._migrate_legacy_key()
         self._conn.commit()
 
@@ -127,6 +129,13 @@ class Database:
             self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
             self._conn.commit()
 
+    def _ensure_enabled_column(self) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(api_keys)")}
+        if "enabled" in columns:
+            return
+        self._conn.execute("ALTER TABLE api_keys ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+        self._conn.execute("UPDATE api_keys SET enabled = 1")
+
     def _migrate_legacy_key(self) -> None:
         row = self._conn.execute("SELECT value FROM settings WHERE key = 'api_key'").fetchone()
         if row is None or not row["value"]:
@@ -135,9 +144,8 @@ class Database:
         existing = self._conn.execute("SELECT id FROM api_keys WHERE key = ?", (secret,)).fetchone()
         now = int(time.time())
         if existing is None:
-            self._conn.execute("UPDATE api_keys SET active = 0")
             self._conn.execute(
-                "INSERT INTO api_keys (label, key, active, created_at, updated_at) VALUES ('', ?, 1, ?, ?)",
+                "INSERT INTO api_keys (label, key, enabled, created_at, updated_at) VALUES ('', ?, 1, ?, ?)",
                 (secret, now, now),
             )
         self._conn.execute("DELETE FROM settings WHERE key = 'api_key'")
@@ -146,8 +154,8 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, label, key, active FROM api_keys
-                ORDER BY active DESC, COALESCE(NULLIF(label, ''), key) COLLATE NOCASE
+                SELECT id, label, key, enabled FROM api_keys
+                ORDER BY enabled DESC, COALESCE(NULLIF(label, ''), key) COLLATE NOCASE
                 """
             ).fetchall()
         return [self._public_key(row) for row in rows]
@@ -157,42 +165,47 @@ class Database:
         text = clean_label(label)
         now = int(time.time())
         with self._lock:
-            self._conn.execute("UPDATE api_keys SET active = 0")
             existing = self._conn.execute("SELECT id FROM api_keys WHERE key = ?", (secret,)).fetchone()
             if existing:
                 key_id = existing["id"]
                 self._conn.execute(
-                    "UPDATE api_keys SET label = ?, active = 1, updated_at = ? WHERE id = ?",
+                    "UPDATE api_keys SET label = ?, enabled = 1, updated_at = ? WHERE id = ?",
                     (text, now, key_id),
                 )
             else:
                 cursor = self._conn.execute(
-                    "INSERT INTO api_keys (label, key, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+                    "INSERT INTO api_keys (label, key, enabled, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
                     (text, secret, now, now),
                 )
                 key_id = int(cursor.lastrowid)
             self._conn.commit()
             row = self._conn.execute(
-                "SELECT id, label, key, active FROM api_keys WHERE id = ?", (key_id,)
+                "SELECT id, label, key, enabled FROM api_keys WHERE id = ?", (key_id,)
             ).fetchone()
         return self._public_key(row)
 
-    def activate_api_key(self, key_id: int) -> dict[str, str | int | bool] | None:
+    def set_api_key_enabled(self, key_id: int, enabled: bool) -> dict[str, str | int | bool] | None:
         now = int(time.time())
         with self._lock:
             existing = self._conn.execute("SELECT id FROM api_keys WHERE id = ?", (key_id,)).fetchone()
             if existing is None:
                 return None
-            self._conn.execute("UPDATE api_keys SET active = 0")
             self._conn.execute(
-                "UPDATE api_keys SET active = 1, updated_at = ? WHERE id = ?",
-                (now, key_id),
+                "UPDATE api_keys SET enabled = ?, updated_at = ? WHERE id = ?",
+                (1 if enabled else 0, now, key_id),
             )
             self._conn.commit()
             row = self._conn.execute(
-                "SELECT id, label, key, active FROM api_keys WHERE id = ?", (key_id,)
+                "SELECT id, label, key, enabled FROM api_keys WHERE id = ?", (key_id,)
             ).fetchone()
         return self._public_key(row)
+
+    def enabled_api_keys(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key FROM api_keys WHERE enabled = 1 ORDER BY id"
+            ).fetchall()
+        return [row["key"] for row in rows]
 
     def delete_api_key(self, key_id: int) -> bool:
         with self._lock:
@@ -202,19 +215,13 @@ class Database:
 
     def clear_active_api_key(self) -> bool:
         with self._lock:
-            row = self._conn.execute("SELECT id FROM api_keys WHERE active = 1 LIMIT 1").fetchone()
-            if row is None:
-                return False
-            self._conn.execute("DELETE FROM api_keys WHERE id = ?", (row["id"],))
+            cursor = self._conn.execute("UPDATE api_keys SET enabled = 0 WHERE enabled = 1")
             self._conn.commit()
-            return True
+            return cursor.rowcount > 0
 
     def api_key(self) -> str:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT key FROM api_keys WHERE active = 1 ORDER BY updated_at DESC LIMIT 1"
-            ).fetchone()
-        return row["key"] if row else ""
+        keys = self.enabled_api_keys()
+        return keys[0] if keys else ""
 
     @staticmethod
     def _public_key(row: sqlite3.Row) -> dict[str, str | int | bool]:
@@ -222,7 +229,7 @@ class Database:
             "id": row["id"],
             "label": row["label"],
             "hint": mask_secret(row["key"]),
-            "active": bool(row["active"]),
+            "enabled": bool(row["enabled"]),
         }
 
     def rate(self) -> float:

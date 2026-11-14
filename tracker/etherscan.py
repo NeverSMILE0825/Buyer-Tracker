@@ -13,6 +13,8 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from tracker.formatutil import mask_secret
+
 API_URL = "https://api.etherscan.io/v2/api"
 CHAIN_ID = "1"
 RESULT_WINDOW = 10_000
@@ -320,3 +322,360 @@ async def fetch_records(
             fetch_page, mid + 1, end, page_size, window_pages, on_progress, depth + 1
         )
         return left_rows + right_rows, left_warnings + right_warnings
+
+
+def split_span(start: int, end: int, parts: int) -> list[tuple[int, int]]:
+    """Split the inclusive span [start, end] into contiguous, non-overlapping pieces."""
+    if end < start:
+        return []
+    width = end - start + 1
+    parts = max(1, min(int(parts), width))
+    base, extra = divmod(width, parts)
+    spans: list[tuple[int, int]] = []
+    cursor = start
+    for index in range(parts):
+        size = base + (1 if index < extra else 0)
+        spans.append((cursor, cursor + size - 1))
+        cursor += size
+    return spans
+
+
+async def scan_span(
+    fetch_page: Callable[[int, int, int], Awaitable[list[dict[str, Any]]]],
+    start: int,
+    end: int,
+    page_size: int,
+    window_pages: int,
+    lanes: int,
+    depth: int = 0,
+    on_touch: Callable[[int, int], Awaitable[None]] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[tuple[int, int]], bool]:
+    """Read one slice of [start, end].
+
+    A full page that covers more than the cursor block is handed back as
+    follow-up spans, so other keys can read the tail at the same time.
+    The returned rows never include a block that a follow-up span will read.
+    The bool is true when the follow-ups are a retry after a timeout.
+    """
+    collected: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    cursor = start
+
+    async def touch(rows: int, covered: int) -> None:
+        if on_touch:
+            await on_touch(rows, covered)
+
+    while cursor <= end:
+        window: list[dict[str, Any]] = []
+        hit_end = False
+        for page in range(1, window_pages + 1):
+            try:
+                batch = await fetch_page(cursor, end, page)
+            except (QueryTimeout, WindowExceeded) as exc:
+                if start >= end or depth > 40:
+                    return [], [
+                        f"Block {start:,} could not be loaded from Etherscan ({exc}). Results are missing that block."
+                    ], [], False
+                mid = (start + end) // 2
+                return [], [], [(start, mid), (mid + 1, end)], True
+            window.extend(batch)
+            if window:
+                highest = max(int(row["blockNumber"]) for row in window)
+                covered = highest if len(batch) < page_size else highest - 1
+                await touch(len(collected) + len(window), covered)
+            if len(batch) < page_size:
+                hit_end = True
+                break
+            highest = max(int(row["blockNumber"]) for row in window)
+            if lanes > 1 and highest > cursor:
+                kept = [row for row in window if int(row["blockNumber"]) < highest]
+                collected.extend(kept)
+                return collected, warnings, split_span(highest, end, lanes), False
+        if hit_end:
+            collected.extend(window)
+            await touch(len(collected), end)
+            return collected, warnings, [], False
+        if not window:
+            if cursor < end and depth <= 40:
+                mid = (cursor + end) // 2
+                return [], [], [(cursor, mid), (mid + 1, end)], True
+            return [], [
+                f"Block {cursor:,} could not be loaded from Etherscan. Results are missing that block."
+            ], [], False
+        last_block = max(int(row["blockNumber"]) for row in window)
+        if last_block <= cursor:
+            collected.extend(window)
+            cap = page_size * window_pages
+            warnings.append(
+                f"Block {cursor:,} has more than {cap:,} records, above Etherscan's page window. That block may be incomplete."
+            )
+            cursor = last_block + 1
+            await touch(len(collected), cursor - 1)
+            continue
+        if lanes > 1:
+            kept = [row for row in window if int(row["blockNumber"]) < last_block]
+            collected.extend(kept)
+            return collected, warnings, split_span(last_block, end, lanes), False
+        collected.extend(row for row in window if int(row["blockNumber"]) < last_block)
+        cursor = last_block
+        await touch(len(collected), cursor - 1)
+    return collected, warnings, [], False
+
+
+async def parallel_walk(
+    fetch_page: Callable[[int, int, int], Awaitable[list[dict[str, Any]]]],
+    start: int,
+    end: int,
+    page_size: int,
+    window_pages: int,
+    lanes: int,
+    on_progress: Callable[[int, int, int], Awaitable[None]] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Walk [start, end] with several lanes. Each lane uses its own fetch_page."""
+    if end < start:
+        return [], []
+    lanes = max(1, lanes)
+    total_blocks = end - start + 1
+    collected: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    done_blocks = 0
+    done_rows = 0
+    partial: dict[tuple[int, int], tuple[int, int]] = {}
+    pending = 0
+    jobs = 0
+    state = asyncio.Lock()
+    queue: asyncio.Queue[tuple[int, int, int] | None] = asyncio.Queue()
+
+    async def emit() -> None:
+        if on_progress is None:
+            return
+        blocks = done_blocks
+        rows = done_rows
+        for (span_start, span_end), (rows_here, covered) in partial.items():
+            rows += rows_here
+            if covered >= span_start:
+                blocks += min(span_end, covered) - span_start + 1
+        await on_progress(rows, min(total_blocks, max(0, blocks)), total_blocks)
+
+    async def enqueue(span_start: int, span_end: int, depth: int) -> None:
+        nonlocal pending, jobs
+        if span_start > span_end:
+            return
+        async with state:
+            jobs += 1
+            if jobs > 200_000:
+                raise EtherscanError("This range produced too many scan slices.")
+            pending += 1
+        await queue.put((span_start, span_end, depth))
+
+    async def finish_job() -> None:
+        nonlocal pending
+        async with state:
+            pending -= 1
+            finished = pending == 0
+        if finished:
+            for _ in range(workers):
+                await queue.put(None)
+
+    async def worker(
+        lane_fetch: Callable[[int, int, int], Awaitable[list[dict[str, Any]]]],
+    ) -> None:
+        nonlocal done_blocks, done_rows
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            span_start, span_end, depth = item
+            try:
+                async def on_touch(rows: int, covered: int) -> None:
+                    nonlocal done_blocks, done_rows
+                    async with state:
+                        partial[(span_start, span_end)] = (rows, covered)
+                        await emit()
+
+                rows, span_warnings, followups, bisect = await scan_span(
+                    lane_fetch,
+                    span_start,
+                    span_end,
+                    page_size,
+                    window_pages,
+                    lanes,
+                    depth,
+                    on_touch,
+                )
+                async with state:
+                    partial.pop((span_start, span_end), None)
+                    collected.extend(rows)
+                    warnings.extend(span_warnings)
+                    if followups:
+                        if rows:
+                            boundary = followups[0][0]
+                            if boundary > span_start:
+                                done_blocks += boundary - span_start
+                            done_rows += len(rows)
+                    else:
+                        done_blocks += span_end - span_start + 1
+                        done_rows += len(rows)
+                    await emit()
+                next_depth = depth + 1 if bisect else 0
+                for piece_start, piece_end in followups:
+                    await enqueue(piece_start, piece_end, next_depth)
+            finally:
+                await finish_job()
+
+    await enqueue(start, end, 0)
+    lane_fetches = fetch_page if isinstance(fetch_page, list) else [fetch_page] * lanes
+    workers = len(lane_fetches)
+    try:
+        async with asyncio.TaskGroup() as group:
+            for lane_fetch in lane_fetches:
+                group.create_task(worker(lane_fetch))
+    except BaseExceptionGroup as group:
+        errors = [exc for exc in group.exceptions if not isinstance(exc, asyncio.CancelledError)]
+        if not errors:
+            raise
+        for exc in errors:
+            if isinstance(exc, EtherscanError):
+                raise exc
+        raise errors[0]
+    return collected, warnings
+
+
+class KeyPool:
+    """One paced client per enabled key. Account scans share the work across them."""
+
+    def __init__(self, api_keys: list[str], http: httpx.AsyncClient, rate: float, page_size: int):
+        if not api_keys:
+            raise EtherscanError("Add an Etherscan API key in the sidebar first.")
+        self.clients = [EtherscanClient(key, http, rate, page_size) for key in api_keys]
+        self.page_size = min(10_000, max(100, int(page_size)))
+        self._rr = 0
+        self._rr_lock = asyncio.Lock()
+
+    @property
+    def calls(self) -> int:
+        return sum(client.calls for client in self.clients)
+
+    @property
+    def key_count(self) -> int:
+        return len(self.clients)
+
+    async def next_client(self) -> EtherscanClient:
+        async with self._rr_lock:
+            client = self.clients[self._rr % len(self.clients)]
+            self._rr += 1
+            return client
+
+    async def latest_block(self) -> int:
+        client = await self.next_client()
+        return await client.latest_block()
+
+    async def block_by_time(self, timestamp: int, closest: str) -> int:
+        client = await self.next_client()
+        return await client.block_by_time(timestamp, closest)
+
+    async def fetch_account(
+        self,
+        action: str,
+        address: str,
+        start_block: int,
+        end_block: int,
+        on_progress: Callable[[int, int, int], Awaitable[None]] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        if len(self.clients) == 1:
+            return await self._fetch_one(self.clients[0], action, address, start_block, end_block, on_progress)
+        warnings: list[str] = []
+        try:
+            rows, walk_warnings = await self._fetch_many(
+                action, address, start_block, end_block, self.page_size, on_progress
+            )
+        except PageSizeRejected:
+            if self.page_size <= 1000:
+                raise
+            self.page_size = 1000
+            for client in self.clients:
+                client.page_size = 1000
+            warnings.append(
+                "These API keys rejected the larger page size, so the scan continued at 1,000 records per request. Set Records per request to 1,000 in Settings."
+            )
+            rows, walk_warnings = await self._fetch_many(
+                action, address, start_block, end_block, 1000, on_progress
+            )
+        warnings.extend(walk_warnings)
+        return rows, warnings
+
+    async def _fetch_one(
+        self,
+        client: EtherscanClient,
+        action: str,
+        address: str,
+        start_block: int,
+        end_block: int,
+        on_progress: Callable[[int, int, int], Awaitable[None]] | None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        total = end_block - start_block + 1
+
+        async def adapt(rows: int, reached: int) -> None:
+            if on_progress is None:
+                return
+            if total <= 0:
+                await on_progress(rows, 1, 1)
+                return
+            done = 0 if reached < start_block else min(end_block, reached) - start_block + 1
+            await on_progress(rows, done, total)
+
+        try:
+            return await client.fetch_account(action, address, start_block, end_block, adapt)
+        except EtherscanError as exc:
+            raise self._keyed(client, exc) from exc
+
+    async def _fetch_many(
+        self,
+        action: str,
+        address: str,
+        start_block: int,
+        end_block: int,
+        page_size: int,
+        on_progress: Callable[[int, int, int], Awaitable[None]] | None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        window_pages = max(1, min(10, RESULT_WINDOW // page_size))
+
+        def lane(client: EtherscanClient):
+            async def fetch_page(start: int, end: int, page: int) -> list[dict[str, Any]]:
+                try:
+                    rows = await client.call(
+                        {
+                            "module": "account",
+                            "action": action,
+                            "address": address,
+                            "startblock": start,
+                            "endblock": end,
+                            "page": page,
+                            "offset": page_size,
+                            "sort": "asc",
+                        },
+                        as_list=True,
+                    )
+                    return rows
+                except EtherscanError as exc:
+                    raise self._keyed(client, exc) from exc
+
+            return fetch_page
+
+        return await parallel_walk(
+            [lane(client) for client in self.clients],
+            start_block,
+            end_block,
+            page_size,
+            window_pages,
+            len(self.clients),
+            on_progress,
+        )
+
+    @staticmethod
+    def _keyed(client: EtherscanClient, exc: EtherscanError) -> EtherscanError:
+        if "rejected the API key" not in str(exc):
+            return exc
+        return EtherscanError(
+            f"Etherscan rejected {mask_secret(client.api_key)}. Turn that key off, or replace it, and try again."
+        )
