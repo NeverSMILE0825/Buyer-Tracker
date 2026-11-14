@@ -53,6 +53,12 @@ const state = {
   progressFraction: 0,
   progressDone: false,
   progressFailed: false,
+  live: false,
+  notify: false,
+  seenReady: false,
+  seenAddress: "",
+  seenHashes: new Set(),
+  seenMaxBlock: 0,
 };
 const PAGE_SIZES = [25, 50, 100, 250];
 
@@ -86,6 +92,9 @@ const settingsDialog = $("settingsDialog");
 let controller = null;
 let progressTimer = 0;
 let progressStarted = 0;
+let liveTimer = 0;
+let trackKeepPage = false;
+const LIVE_MS = 15000;
 let sliceStart = -1;
 let sliceEnd = -1;
 let filterTimer = 0;
@@ -517,8 +526,9 @@ function setPageSize(size) {
   saveForm();
 }
 
-function applyView() {
+function applyView(keepPage = false) {
   const query = state.filter.trim().toLowerCase();
+  const keptPage = state.page;
   const chips = CHIPS.filter((chip) => state.chips.has(chip.id));
   const view = [];
   for (let index = 0; index < state.rows.length; index += 1) {
@@ -530,7 +540,8 @@ function applyView() {
   }
   view.sort((a, b) => compare(state.rows[a], state.rows[b]));
   state.view = view;
-  state.page = 1;
+  const pages = Math.max(1, Math.ceil(view.length / state.pageSize) || 1);
+  state.page = keepPage ? Math.min(Math.max(1, keptPage), pages) : 1;
   renderSummary();
   renderHead();
   renderPager();
@@ -653,14 +664,16 @@ function renderSummary() {
   ethNote.hidden = !meta.transfers;
 }
 
-function showResults(payload) {
+function showResults(payload, keepPage = false) {
   state.rows = payload.rows || [];
   state.meta = payload.meta || null;
   state.loaded = true;
-  state.page = 1;
+  if (!keepPage) {
+    state.page = 1;
+    tableWrap.scrollTop = 0;
+  }
   for (const row of state.rows) buildSearch(row);
-  tableWrap.scrollTop = 0;
-  applyView();
+  applyView(keepPage);
   requestAnimationFrame(() => paint(true));
 }
 
@@ -737,13 +750,20 @@ function finishProgress(meta) {
   progress.classList.remove("running", "failed");
   progress.classList.add("complete");
   const count = Number(meta.transfers || 0);
+  const liveLabel = state.live ? " · live" : "";
   progressText.textContent = count
-    ? `${count.toLocaleString()} transfers ready`
-    : "No transfers in this range";
-  progressTime.textContent = `Fetched in ${formatDuration(meta.elapsed_ms)}`;
+    ? `${count.toLocaleString()} transfers ready${liveLabel}`
+    : `No transfers in this range${liveLabel}`;
+  const fromComputer = Number(meta.fetched_blocks) === 0 && Number(meta.cached_blocks) > 0;
+  progressTime.textContent = `${fromComputer ? "Loaded" : "Fetched"} in ${formatDuration(meta.elapsed_ms)}`;
   const bits = [];
   if (meta.start_block != null && meta.end_block != null) {
     bits.push(`Blocks ${Number(meta.start_block).toLocaleString()}–${Number(meta.end_block).toLocaleString()}`);
+  }
+  if (fromComputer) bits.push("Loaded from this computer");
+  else if (Number(meta.cached_blocks) > 0 && Number(meta.fetched_blocks) > 0) {
+    bits.push(`${Number(meta.cached_blocks).toLocaleString()} saved blocks`);
+    bits.push(`${Number(meta.fetched_blocks).toLocaleString()} fetched`);
   }
   if (meta.api_calls != null) bits.push(`${Number(meta.api_calls).toLocaleString()} API calls`);
   if (Number(meta.keys) > 1) bits.push(`${Number(meta.keys)} keys`);
@@ -807,9 +827,143 @@ function setRunning(running) {
   }
 }
 
-async function trackTransfers(event) {
-  event.preventDefault();
+async function moveRangeToTip() {
+  if (state.mode === "time") {
+    const current = readTime("endTime");
+    const now = Math.floor(Date.now() / 1000);
+    if (current == null || now > current) $("endTime").value = toLocalInput(new Date());
+    return;
+  }
+  const data = await getJSON("/api/latest-block");
+  const current = Number($("endBlock").value);
+  if (!Number.isFinite(current) || data.block > current) $("endBlock").value = String(data.block);
+}
+
+function stopLive() {
+  state.live = false;
+  $("liveMode").checked = false;
+  if (liveTimer) {
+    clearInterval(liveTimer);
+    liveTimer = 0;
+  }
+  saveForm();
+}
+
+function armLive() {
+  if (liveTimer) clearInterval(liveTimer);
+  liveTimer = window.setInterval(() => {
+    if (!state.live || state.running) return;
+    trackTransfers(null, { fromLive: true }).catch((error) => showError(error.message));
+  }, LIVE_MS);
+}
+
+function setLive(on) {
+  state.live = on;
+  $("liveMode").checked = on;
+  saveForm();
+  if (liveTimer) {
+    clearInterval(liveTimer);
+    liveTimer = 0;
+  }
+  if (!on) {
+    if (progressText.textContent.endsWith(" · live")) {
+      progressText.textContent = progressText.textContent.slice(0, -" · live".length);
+    }
+    return;
+  }
+  armLive();
+  if (!state.running) {
+    trackTransfers(null, { fromLive: true }).catch((error) => showError(error.message));
+  }
+}
+
+async function setNotify(on) {
+  if (!on) {
+    state.notify = false;
+    $("notifyMode").checked = false;
+    saveForm();
+    return;
+  }
+  if (!("Notification" in window)) {
+    state.notify = false;
+    $("notifyMode").checked = false;
+    showError("This browser cannot show system notifications.");
+    saveForm();
+    return;
+  }
+  let permission = Notification.permission;
+  if (permission === "default") permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    state.notify = false;
+    $("notifyMode").checked = false;
+    showError("Allow notifications for this site to get alerts while you are in another window.");
+    saveForm();
+    return;
+  }
+  state.notify = true;
+  $("notifyMode").checked = true;
   showError("");
+  saveForm();
+}
+
+function announceTransfers(rows) {
+  const address = state.meta?.address || "";
+  const hashes = new Set();
+  let maxBlock = 0;
+  for (const row of rows) {
+    if (row.hash) hashes.add(row.hash);
+    const block = Number(row.block) || 0;
+    if (block > maxBlock) maxBlock = block;
+  }
+  const sameWallet = state.seenReady && state.seenAddress === address;
+  const previousMax = state.seenMaxBlock;
+  const previous = state.seenHashes;
+  state.seenAddress = address;
+  state.seenHashes = hashes;
+  state.seenMaxBlock = Math.max(previousMax, maxBlock);
+  if (!sameWallet) {
+    state.seenReady = true;
+    state.seenMaxBlock = maxBlock;
+    return;
+  }
+  if (!state.notify || Notification.permission !== "granted") return;
+  const fresh = rows.filter((row) => row.hash && !previous.has(row.hash) && (Number(row.block) || 0) >= previousMax);
+  if (!fresh.length) return;
+  const who = (state.meta?.label || "").trim() || `${address.slice(0, 6)}…${address.slice(-4)}`;
+  const symbols = [...new Set(fresh.map((row) => row.token_symbol).filter(Boolean))].slice(0, 3);
+  const noun = fresh.length === 1 ? "transfer" : "transfers";
+  const detail = symbols.length ? ` · ${symbols.join(", ")}` : "";
+  let note;
+  try {
+    note = new Notification("Buyer Tracker", {
+      body: `${fresh.length} new ${noun} for ${who}${detail}`,
+      tag: "buyer-tracker",
+      renotify: true,
+    });
+  } catch {
+    note = new Notification("Buyer Tracker", {
+      body: `${fresh.length} new ${noun} for ${who}${detail}`,
+      tag: "buyer-tracker",
+    });
+  }
+  note.onclick = () => {
+    window.focus();
+    note.close();
+  };
+}
+
+async function trackTransfers(event, options = {}) {
+  if (event) event.preventDefault();
+  const fromLive = Boolean(options.fromLive);
+  showError("");
+  if (fromLive) {
+    try {
+      await moveRangeToTip();
+    } catch (error) {
+      showError(error.message);
+      return;
+    }
+  }
   const address = addressInput.value.trim();
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
     showError("Enter a wallet address (0x and 40 hex characters).");
@@ -827,7 +981,7 @@ async function trackTransfers(event) {
       showError("Start time must be before the end time.");
       return;
     }
-    if (payload.end_time - payload.start_time > 180 * 86400) {
+    if (!fromLive && payload.end_time - payload.start_time > 180 * 86400) {
       if (!confirm("This time range is longer than 180 days and can take a while. Continue?")) return;
     }
   } else {
@@ -843,13 +997,14 @@ async function trackTransfers(event) {
       showError("Start block must be less than or equal to the end block.");
       return;
     }
-    if (end - start > 1_500_000) {
+    if (!fromLive && end - start > 1_500_000) {
       if (!confirm("This block range is very wide and can take a while. Continue?")) return;
     }
     payload.start_block = start;
     payload.end_block = end;
   }
   saveForm();
+  trackKeepPage = fromLive && state.loaded;
   if (controller) controller.abort();
   controller = new AbortController();
   setRunning(true);
@@ -901,7 +1056,8 @@ function handleEvent(message) {
   }
   if (message.type === "done") {
     finishProgress(message.meta || {});
-    showResults(message);
+    showResults(message, trackKeepPage);
+    announceTransfers(message.rows || []);
   }
 }
 
@@ -918,6 +1074,8 @@ function saveForm() {
       ageMode: state.ageMode,
       hideZero: state.hideZero,
       pageSize: state.pageSize,
+      live: state.live,
+      notify: state.notify,
     }));
   } catch { /* private mode */ }
 }
@@ -934,7 +1092,11 @@ function restoreForm() {
   if (saved?.startBlock) $("startBlock").value = saved.startBlock;
   if (saved?.endBlock) $("endBlock").value = saved.endBlock;
   state.hideZero = Boolean(saved?.hideZero);
+  state.live = Boolean(saved?.live);
+  state.notify = Boolean(saved?.notify) && "Notification" in window && Notification.permission === "granted";
   $("hideZero").checked = state.hideZero;
+  $("liveMode").checked = state.live;
+  $("notifyMode").checked = state.notify;
   const savedSize = Number(saved?.pageSize);
   state.pageSize = PAGE_SIZES.includes(savedSize) ? savedSize : 50;
   $("pageSizeSelect").value = String(state.pageSize);
@@ -962,7 +1124,14 @@ function bind() {
   $("latestBlockBtn").addEventListener("click", () => {
     fillLatestBlock().catch((error) => showError(error.message));
   });
-  $("stopBtn").addEventListener("click", () => controller && controller.abort());
+  $("stopBtn").addEventListener("click", () => {
+    stopLive();
+    if (controller) controller.abort();
+  });
+  $("liveMode").addEventListener("change", () => setLive($("liveMode").checked));
+  $("notifyMode").addEventListener("change", () => {
+    setNotify($("notifyMode").checked).catch((error) => showError(error.message));
+  });
   $("settingsBtn").addEventListener("click", openSettings);
   $("addKey").addEventListener("click", focusKeyForm);
   $("saveKeyBtn").addEventListener("click", () => {
@@ -1043,6 +1212,10 @@ async function init() {
     await Promise.all([loadWallets(), loadKeys(), loadSettings()]);
   } catch (error) {
     showError(error.message);
+  }
+  if (state.live) {
+    armLive();
+    trackTransfers(null, { fromLive: true }).catch((error) => showError(error.message));
   }
 }
 

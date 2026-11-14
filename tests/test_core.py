@@ -9,6 +9,7 @@ from pathlib import Path
 from tracker.analyze import build_rows, decode_universal_router, _selector
 from tracker.checksum import to_checksum_address
 from tracker.db import Database
+from tracker.cache import REORG_BLOCKS, collect_records, uncovered_spans
 from tracker.etherscan import QueryTimeout, classify, fetch_records, parallel_walk, split_span, walk_records
 from tracker.service import block_fraction
 from tracker.formatutil import clean_label, format_amount, pretty_method, sort_units, token_amount
@@ -547,6 +548,83 @@ class ApiTests(unittest.TestCase):
                 db.delete_wallet(address)
                 if created_id is not None:
                     db.delete_api_key(created_id)
+
+
+class CacheTests(unittest.TestCase):
+    def test_uncovered_spans_skip_saved_blocks_and_reopen_the_tip(self):
+        self.assertEqual(uncovered_spans(0, 40, [], None), [(0, 40)])
+        self.assertEqual(uncovered_spans(0, 40, [(0, 40)], None), [])
+        self.assertEqual(uncovered_spans(0, 80, [(0, 50)], None), [(51, 80)])
+        self.assertEqual(uncovered_spans(0, 40, [(0, 10), (30, 40)], None), [(11, 29)])
+        head = 100
+        tip = head - REORG_BLOCKS + 1
+        self.assertEqual(uncovered_spans(0, head, [(0, head)], head), [(tip, head)])
+        self.assertEqual(uncovered_spans(0, tip - 1, [(0, head)], head), [])
+
+    def test_saved_rows_replace_a_refetched_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "tracker.db")
+            wallet = "0x" + "ab" * 20
+            first = {"blockNumber": "5", "hash": "0xaaa", "logIndex": "1", "value": "1"}
+            database.replace_cached_rows(wallet, "tokentx", 1, 10, [first])
+            database.add_coverage(wallet, "tokentx", 1, 10)
+            self.assertEqual(database.coverage_spans(wallet, "tokentx"), [(1, 10)])
+            replacement = {"blockNumber": "5", "hash": "0xbbb", "logIndex": "1", "value": "2"}
+            database.replace_cached_rows(wallet, "tokentx", 5, 5, [replacement])
+            loaded = database.load_cached_rows(wallet, "tokentx", 1, 10)
+            self.assertEqual([row["hash"] for row in loaded], ["0xbbb"])
+            database.add_coverage(wallet, "tokentx", 11, 12)
+            self.assertEqual(database.coverage_spans(wallet, "tokentx"), [(1, 12)])
+            database._conn.close()
+
+
+class CollectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_scan_fetches_only_the_new_tip(self):
+        wallet = "0x" + "cd" * 20
+        rows = [
+            {"blockNumber": "10", "hash": "0x1", "logIndex": "1"},
+            {"blockNumber": "20", "hash": "0x2", "logIndex": "1"},
+        ]
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def fetch_account(self, kind, address, start, end, on_progress=None):
+                self.calls.append((kind, start, end))
+                matched = [row for row in rows if start <= int(row["blockNumber"]) <= end]
+                if on_progress is not None:
+                    await on_progress(len(matched), end - start + 1, end - start + 1)
+                return matched, []
+
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "tracker.db")
+            client = FakeClient()
+            loaded, warnings, cached, fetched = await collect_records(
+                database, client, wallet, "tokentx", 10, 20, 1_000, None
+            )
+            self.assertEqual(warnings, [])
+            self.assertEqual(cached, 0)
+            self.assertEqual(fetched, 11)
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual(client.calls, [("tokentx", 10, 20)])
+
+            client.calls.clear()
+            loaded, _, cached, fetched = await collect_records(
+                database, client, wallet, "tokentx", 10, 20, 1_000, None
+            )
+            self.assertEqual(client.calls, [])
+            self.assertEqual(fetched, 0)
+            self.assertEqual(cached, 11)
+            self.assertEqual(len(loaded), 2)
+
+            loaded, _, _, fetched = await collect_records(
+                database, client, wallet, "tokentx", 10, 30, 1_000, None
+            )
+            self.assertEqual(client.calls, [("tokentx", 21, 30)])
+            self.assertEqual(fetched, 10)
+            self.assertEqual(len(loaded), 2)
+            database._conn.close()
 
 
 if __name__ == "__main__":

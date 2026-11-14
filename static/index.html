@@ -99,6 +99,14 @@
         <div class="actions">
           <button type="submit" class="primary" id="trackBtn">Track transfers</button>
           <button type="button" class="ghost danger" id="stopBtn" hidden>Stop</button>
+          <div class="live-options">
+            <label class="check" title="Keep the end of the range on the latest block, or on the current time, and refresh the saved transfers.">
+              <input id="liveMode" type="checkbox"> Live
+            </label>
+            <label class="check" title="Show a system notification when a new transfer arrives. The tab stays open in the background.">
+              <input id="notifyMode" type="checkbox"> Notify
+            </label>
+          </div>
           <p id="formError" class="error" role="alert" hidden></p>
         </div>
       </form>

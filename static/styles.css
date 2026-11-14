@@ -214,7 +214,8 @@ button:focus-visible, input:focus-visible {
 .end-block { display: flex; gap: 8px; align-items: stretch; }
 .end-block input { flex: 1; min-width: 0; }
 .end-block .ghost { white-space: nowrap; padding: 8px 12px; }
-.actions { display: flex; gap: 10px; align-items: center; min-height: 38px; }
+.actions { display: flex; gap: 10px; align-items: center; min-height: 38px; flex-wrap: wrap; }
+.live-options { display: flex; gap: 14px; align-items: center; }
 .primary, .ghost { padding: 8px 14px; }
 .primary { background: var(--brass); color: var(--brass-ink); border-color: #f0cb86; font-weight: 650; }
 .primary:hover { filter: brightness(1.05); }

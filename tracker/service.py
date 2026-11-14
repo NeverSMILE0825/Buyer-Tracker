@@ -7,6 +7,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from tracker.analyze import build_rows
+from tracker.cache import collect_records
 from tracker.checksum import normalize_address
 from tracker.db import db
 from tracker.etherscan import EtherscanError, KeyPool
@@ -131,6 +132,7 @@ async def track(
             client.key_count,
         )
     start, end, used_start, used_end = resolved
+    head = await client.latest_block()
     await report.send(
         "Reading token transfers",
         RESOLVE_FRACTION,
@@ -142,8 +144,8 @@ async def track(
     async def token_progress(count: int, blocks_done: int, blocks_total: int) -> None:
         await report.token(count, blocks_done, blocks_total, start, end)
 
-    transfers, warnings = await client.fetch_account(
-        "tokentx", wallet, start, end, token_progress
+    transfers, warnings, cached_blocks, fetched_blocks = await collect_records(
+        db, client, wallet, "tokentx", start, end, head, token_progress
     )
     if not transfers:
         await report.send(
@@ -166,6 +168,8 @@ async def track(
             client.calls,
             started,
             client.key_count,
+            cached_blocks,
+            fetched_blocks,
         )
 
     blocks = [int(item["blockNumber"]) for item in transfers if item.get("blockNumber")]
@@ -185,11 +189,13 @@ async def track(
     async def internal_progress(count: int, blocks_done: int, blocks_total: int) -> None:
         await report.eth("internal", count, blocks_done, blocks_total, span_start, span_end)
 
-    tx_task = client.fetch_account("txlist", wallet, span_start, span_end, tx_progress)
-    internal_task = client.fetch_account(
-        "txlistinternal", wallet, span_start, span_end, internal_progress
+    tx_task = collect_records(
+        db, client, wallet, "txlist", span_start, span_end, head, tx_progress
     )
-    (transactions, tx_warnings), (internals, internal_warnings) = await asyncio.gather(
+    internal_task = collect_records(
+        db, client, wallet, "txlistinternal", span_start, span_end, head, internal_progress
+    )
+    (transactions, tx_warnings, _, _), (internals, internal_warnings, _, _) = await asyncio.gather(
         tx_task, internal_task
     )
     warnings.extend(tx_warnings)
@@ -224,6 +230,8 @@ async def track(
         client.calls,
         started,
         client.key_count,
+        cached_blocks,
+        fetched_blocks,
     )
 
 
@@ -272,6 +280,8 @@ def _payload(
     api_calls: int,
     started: float,
     keys: int = 1,
+    cached_blocks: int = 0,
+    fetched_blocks: int = 0,
 ) -> dict[str, Any]:
     tokens = len({row["token_contract"].lower() for row in rows}) if rows else 0
     return {
@@ -288,6 +298,8 @@ def _payload(
             "tokens": tokens,
             "api_calls": api_calls,
             "keys": keys,
+            "cached_blocks": cached_blocks,
+            "fetched_blocks": fetched_blocks,
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
             "warnings": [item for item in warnings if item],
         },

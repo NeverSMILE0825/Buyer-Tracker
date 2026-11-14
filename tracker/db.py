@@ -5,11 +5,14 @@ API keys never leave this computer except in requests to Etherscan.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
+from tracker.cache import merge_spans, row_identity
 from tracker.checksum import normalize_address
 from tracker.formatutil import clean_api_key, clean_label, mask_secret
 
@@ -58,6 +61,34 @@ class Database:
                 updated_at INTEGER NOT NULL
             )
             """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_coverage (
+                wallet TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                start_block INTEGER NOT NULL,
+                end_block INTEGER NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cached_rows (
+                wallet TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                block INTEGER NOT NULL,
+                row_key TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (wallet, kind, row_key)
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cached_rows_span ON cached_rows (wallet, kind, block)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_coverage_wallet ON scan_coverage (wallet, kind)"
         )
         self._ensure_enabled_column()
         self._migrate_legacy_key()
@@ -231,6 +262,92 @@ class Database:
             "hint": mask_secret(row["key"]),
             "enabled": bool(row["enabled"]),
         }
+
+    def coverage_spans(self, wallet: str, kind: str) -> list[tuple[int, int]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT start_block, end_block FROM scan_coverage
+                WHERE wallet = ? AND kind = ?
+                """,
+                (wallet, kind),
+            ).fetchall()
+        return merge_spans([(row["start_block"], row["end_block"]) for row in rows])
+
+    def add_coverage(self, wallet: str, kind: str, start: int, end: int) -> None:
+        if start > end:
+            return
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT start_block, end_block FROM scan_coverage
+                WHERE wallet = ? AND kind = ?
+                """,
+                (wallet, kind),
+            ).fetchall()
+            merged = merge_spans(
+                [(row["start_block"], row["end_block"]) for row in rows] + [(start, end)]
+            )
+            self._conn.execute(
+                "DELETE FROM scan_coverage WHERE wallet = ? AND kind = ?",
+                (wallet, kind),
+            )
+            self._conn.executemany(
+                """
+                INSERT INTO scan_coverage (wallet, kind, start_block, end_block)
+                VALUES (?, ?, ?, ?)
+                """,
+                [(wallet, kind, span_start, span_end) for span_start, span_end in merged],
+            )
+            self._conn.commit()
+
+    def replace_cached_rows(
+        self,
+        wallet: str,
+        kind: str,
+        start: int,
+        end: int,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                DELETE FROM cached_rows
+                WHERE wallet = ? AND kind = ? AND block BETWEEN ? AND ?
+                """,
+                (wallet, kind, start, end),
+            )
+            payload: list[tuple[str, str, int, str, str]] = []
+            seen: set[str] = set()
+            for row in rows:
+                block, key = row_identity(kind, row)
+                if block < start or block > end or not key or key in seen:
+                    continue
+                seen.add(key)
+                payload.append(
+                    (wallet, kind, block, key, json.dumps(row, separators=(",", ":")))
+                )
+            if payload:
+                self._conn.executemany(
+                    """
+                    INSERT INTO cached_rows (wallet, kind, block, row_key, payload)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+            self._conn.commit()
+
+    def load_cached_rows(self, wallet: str, kind: str, start: int, end: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload FROM cached_rows
+                WHERE wallet = ? AND kind = ? AND block BETWEEN ? AND ?
+                ORDER BY block, row_key
+                """,
+                (wallet, kind, start, end),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
     def rate(self) -> float:
         raw = self.get_setting("rate", str(DEFAULT_RATE))
