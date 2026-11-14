@@ -416,6 +416,22 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(database.wallets(), [])
             database._conn.close()
 
+    def test_notify_tokens_keep_a_label_when_the_symbol_is_refreshed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "tracker.db")
+            contract = "0x" + "55" * 20
+            saved = database.save_notify_token(contract, "USDC", "USD Coin", "Stable")
+            self.assertEqual(saved["address"], to_checksum_address(contract))
+            self.assertEqual(saved["label"], "Stable")
+            refreshed = database.save_notify_token(contract.lower(), "USDC", "USD Coin")
+            self.assertEqual(refreshed["label"], "Stable")
+            self.assertEqual(len(database.notify_tokens()), 1)
+            self.assertTrue(database.delete_notify_token(saved["address"]))
+            self.assertEqual(database.notify_tokens(), [])
+            with self.assertRaises(ValueError):
+                database.save_notify_token("0x123", "", "", "")
+            database._conn.close()
+
     def test_api_keys_can_be_enabled_together(self):
         with tempfile.TemporaryDirectory() as folder:
             database = Database(Path(folder) / "tracker.db")

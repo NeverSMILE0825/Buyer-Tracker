@@ -51,6 +51,13 @@ class WalletIn(BaseModel):
     label: str = ""
 
 
+class TokenIn(BaseModel):
+    address: str
+    symbol: str = ""
+    name: str = ""
+    label: str | None = None
+
+
 class ApiKeyIn(BaseModel):
     key: str
     label: str = ""
@@ -114,6 +121,23 @@ def save_wallet(body: WalletIn) -> dict[str, str]:
 def delete_wallet(address: str) -> dict[str, bool]:
     if not db.delete_wallet(address):
         raise HTTPException(status_code=404, detail="Wallet is not saved.")
+    return {"ok": True}
+
+
+@app.get("/api/tokens")
+def list_tokens() -> list[dict[str, str]]:
+    return db.notify_tokens()
+
+
+@app.post("/api/tokens")
+def save_token(body: TokenIn) -> dict[str, str]:
+    return db.save_notify_token(body.address, body.symbol, body.name, body.label)
+
+
+@app.delete("/api/tokens/{address}")
+def delete_token(address: str) -> dict[str, bool]:
+    if not db.delete_notify_token(address):
+        raise HTTPException(status_code=404, detail="Token is not saved.")
     return {"ok": True}
 
 

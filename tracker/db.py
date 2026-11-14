@@ -90,6 +90,18 @@ class Database:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scan_coverage_wallet ON scan_coverage (wallet, kind)"
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notify_tokens (
+                address TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         self._ensure_enabled_column()
         self._migrate_legacy_key()
         self._conn.commit()
@@ -141,6 +153,80 @@ class Database:
 
     def label_map(self) -> dict[str, str]:
         return {row["address"]: row["label"] for row in self.wallets() if row["label"]}
+
+    def notify_tokens(self) -> list[dict[str, str]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT address, symbol, name, label FROM notify_tokens
+                ORDER BY COALESCE(NULLIF(label, ''), NULLIF(symbol, ''), NULLIF(name, ''), address)
+                COLLATE NOCASE
+                """
+            ).fetchall()
+        return [
+            {
+                "address": row["address"],
+                "symbol": row["symbol"],
+                "name": row["name"],
+                "label": row["label"],
+            }
+            for row in rows
+        ]
+
+    def save_notify_token(
+        self,
+        address: str,
+        symbol: str = "",
+        name: str = "",
+        label: str | None = None,
+    ) -> dict[str, str]:
+        try:
+            key = normalize_address(address)
+        except ValueError:
+            raise ValueError("Enter a token contract (0x and 40 hex characters).") from None
+        symbol_text = clean_label(symbol)
+        name_text = clean_label(name)
+        now = int(time.time())
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT symbol, name, label FROM notify_tokens WHERE address = ?",
+                (key,),
+            ).fetchone()
+            if existing:
+                kept_symbol = symbol_text or existing["symbol"]
+                kept_name = name_text or existing["name"]
+                kept_label = existing["label"] if label is None else clean_label(label)
+                self._conn.execute(
+                    """
+                    UPDATE notify_tokens
+                    SET symbol = ?, name = ?, label = ?, updated_at = ?
+                    WHERE address = ?
+                    """,
+                    (kept_symbol, kept_name, kept_label, now, key),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO notify_tokens
+                    (address, symbol, name, label, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (key, symbol_text, name_text, clean_label(label or ""), now, now),
+                )
+            self._conn.commit()
+            return {
+                "address": key,
+                "symbol": symbol_text or (existing["symbol"] if existing else ""),
+                "name": name_text or (existing["name"] if existing else ""),
+                "label": (existing["label"] if existing and label is None else clean_label(label or "")),
+            }
+
+    def delete_notify_token(self, address: str) -> bool:
+        key = normalize_address(address)
+        with self._lock:
+            cursor = self._conn.execute("DELETE FROM notify_tokens WHERE address = ?", (key,))
+            self._conn.commit()
+            return cursor.rowcount > 0
 
     def get_setting(self, key: str, default: str = "") -> str:
         with self._lock:

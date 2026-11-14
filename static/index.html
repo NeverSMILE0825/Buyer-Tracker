@@ -50,6 +50,23 @@
       <p id="keyEmpty" class="muted">No saved keys yet.</p>
       <ul id="keyList" class="wallet-list"></ul>
       <p id="keyStatus" class="side-status" role="status"></p>
+
+      <div class="side-head keys-head">
+        <h2>Notify tokens</h2>
+        <p>Save a token contract here. Turn on Saved tokens next to Notify to alert only for these. With Saved tokens off, Notify reports every new transfer.</p>
+      </div>
+      <label class="field">
+        <span>Token contract</span>
+        <input id="tokenAddress" class="mono" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="0x…">
+      </label>
+      <label class="field">
+        <span>Symbol <em>optional</em></span>
+        <input id="tokenSymbol" maxlength="80" placeholder="USDC">
+      </label>
+      <button type="button" class="ghost" id="saveTokenBtn">Save token</button>
+      <p id="tokenEmpty" class="muted">No saved tokens yet.</p>
+      <ul id="tokenList" class="wallet-list"></ul>
+      <p id="tokenStatus" class="side-status" role="status"></p>
     </aside>
 
     <main class="main">
@@ -105,6 +122,9 @@
             </label>
             <label class="check" title="Show a system notification when a new transfer arrives. The tab stays open in the background.">
               <input id="notifyMode" type="checkbox"> Notify
+            </label>
+            <label class="check" title="Only notify when a transfer moves a saved token. Turn this off to notify every new transfer.">
+              <input id="notifyFilter" type="checkbox"> Saved tokens
             </label>
           </div>
           <p id="formError" class="error" role="alert" hidden></p>

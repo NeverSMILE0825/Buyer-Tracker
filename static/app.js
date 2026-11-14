@@ -55,6 +55,8 @@ const state = {
   progressFailed: false,
   live: false,
   notify: false,
+  notifyFilter: false,
+  tokens: [],
   seenReady: false,
   seenAddress: "",
   seenHashes: new Set(),
@@ -593,7 +595,7 @@ function renderRow(row) {
     <div class="cell"><div class="party">${addressLink(row.to, row.to_label)}${badge("to", row.direction)}</div></div>
     <div class="cell num" title="${esc(row.amount_token_exact)}">${esc(row.amount_token)}</div>
     <div class="cell num ${ethClass}" title="${esc(row.amount_eth_exact)} ETH">${esc(row.amount_eth)}</div>
-    <div class="cell"><button type="button" class="token-btn" data-filter="${esc(row.token)}" title="${esc(row.token_contract)}">${esc(row.token)}</button>${unsafe}</div>
+    <div class="cell token-cell"><button type="button" class="token-btn" data-filter="${esc(row.token)}" title="${esc(row.token_contract)}">${esc(row.token)}</button><button type="button" class="watch-btn${watchingToken(row.token_contract) ? " saved" : ""}" data-watch data-contract="${esc(row.token_contract)}" data-symbol="${esc(row.token_symbol)}" data-name="${esc(row.token_name)}">${watchingToken(row.token_contract) ? "Watching" : "Watch"}</button>${unsafe}</div>
     <div class="cell num" title="${esc(TIPS.count)}">${row.count.toLocaleString()}</div>
   </div>`;
 }
@@ -906,6 +908,81 @@ async function setNotify(on) {
   saveForm();
 }
 
+function setNotifyFilter(on) {
+  state.notifyFilter = on;
+  $("notifyFilter").checked = on;
+  saveForm();
+}
+
+function watchingToken(address) {
+  const key = (address || "").toLowerCase();
+  return state.tokens.some((token) => token.address.toLowerCase() === key);
+}
+
+function tokenTitle(token) {
+  return token.label || token.symbol || token.name || shortAddr(token.address);
+}
+
+function renderTokens() {
+  const list = $("tokenList");
+  list.replaceChildren();
+  $("tokenEmpty").hidden = state.tokens.length !== 0;
+  for (const token of state.tokens) {
+    const item = document.createElement("li");
+    item.className = "wallet";
+    const info = document.createElement("div");
+    info.className = "wallet-pick";
+    const name = document.createElement("span");
+    name.className = "wallet-name";
+    name.textContent = tokenTitle(token);
+    const sub = document.createElement("span");
+    sub.className = "wallet-sub";
+    sub.textContent = token.address;
+    info.append(name, sub);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-btn";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => {
+      removeToken(token).catch((error) => {
+        $("tokenStatus").textContent = error.message;
+      });
+    });
+    item.append(info, remove);
+    list.append(item);
+  }
+}
+
+async function loadTokens() {
+  state.tokens = await getJSON("/api/tokens");
+  renderTokens();
+  if (state.loaded) paint(true);
+}
+
+async function saveToken(body) {
+  const data = await getJSON("/api/tokens", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  $("tokenStatus").textContent = `Saved ${tokenTitle(data)}`;
+  await loadTokens();
+  return data;
+}
+
+async function removeToken(token) {
+  if (!confirm(`Remove ${tokenTitle(token)} from notify tokens?`)) return;
+  await getJSON(`/api/tokens/${encodeURIComponent(token.address)}`, { method: "DELETE" });
+  $("tokenStatus").textContent = `Removed ${tokenTitle(token)}`;
+  await loadTokens();
+}
+
+function rowsForNotify(rows) {
+  if (!state.notifyFilter) return rows;
+  const saved = new Set(state.tokens.map((token) => token.address.toLowerCase()));
+  return rows.filter((row) => saved.has((row.token_contract || "").toLowerCase()));
+}
+
 function announceTransfers(rows) {
   const address = state.meta?.address || "";
   const hashes = new Set();
@@ -927,7 +1004,7 @@ function announceTransfers(rows) {
     return;
   }
   if (!state.notify || Notification.permission !== "granted") return;
-  const fresh = rows.filter((row) => row.hash && !previous.has(row.hash) && (Number(row.block) || 0) >= previousMax);
+  const fresh = rowsForNotify(rows.filter((row) => row.hash && !previous.has(row.hash) && (Number(row.block) || 0) >= previousMax));
   if (!fresh.length) return;
   const who = (state.meta?.label || "").trim() || `${address.slice(0, 6)}…${address.slice(-4)}`;
   const symbols = [...new Set(fresh.map((row) => row.token_symbol).filter(Boolean))].slice(0, 3);
@@ -1076,6 +1153,7 @@ function saveForm() {
       pageSize: state.pageSize,
       live: state.live,
       notify: state.notify,
+      notifyFilter: state.notifyFilter,
     }));
   } catch { /* private mode */ }
 }
@@ -1094,9 +1172,11 @@ function restoreForm() {
   state.hideZero = Boolean(saved?.hideZero);
   state.live = Boolean(saved?.live);
   state.notify = Boolean(saved?.notify) && "Notification" in window && Notification.permission === "granted";
+  state.notifyFilter = Boolean(saved?.notifyFilter);
   $("hideZero").checked = state.hideZero;
   $("liveMode").checked = state.live;
   $("notifyMode").checked = state.notify;
+  $("notifyFilter").checked = state.notifyFilter;
   const savedSize = Number(saved?.pageSize);
   state.pageSize = PAGE_SIZES.includes(savedSize) ? savedSize : 50;
   $("pageSizeSelect").value = String(state.pageSize);
@@ -1131,6 +1211,18 @@ function bind() {
   $("liveMode").addEventListener("change", () => setLive($("liveMode").checked));
   $("notifyMode").addEventListener("change", () => {
     setNotify($("notifyMode").checked).catch((error) => showError(error.message));
+  });
+  $("notifyFilter").addEventListener("change", () => setNotifyFilter($("notifyFilter").checked));
+  $("saveTokenBtn").addEventListener("click", () => {
+    saveToken({
+      address: $("tokenAddress").value.trim(),
+      symbol: $("tokenSymbol").value.trim(),
+      label: $("tokenSymbol").value.trim(),
+    }).then((data) => {
+      $("tokenAddress").value = data.address;
+    }).catch((error) => {
+      $("tokenStatus").textContent = error.message;
+    });
   });
   $("settingsBtn").addEventListener("click", openSettings);
   $("addKey").addEventListener("click", focusKeyForm);
@@ -1190,6 +1282,21 @@ function bind() {
     applyView();
   });
   windowEl.addEventListener("click", (event) => {
+    const watch = event.target.closest("[data-watch]");
+    if (watch) {
+      if (watchingToken(watch.dataset.contract)) {
+        $("tokenStatus").textContent = "That token is already in the notify list.";
+        return;
+      }
+      saveToken({
+        address: watch.dataset.contract,
+        symbol: watch.dataset.symbol || "",
+        name: watch.dataset.name || "",
+      }).catch((error) => {
+        $("tokenStatus").textContent = error.message;
+      });
+      return;
+    }
     const button = event.target.closest("[data-filter]");
     if (!button) return;
     filterInput.value = button.dataset.filter;
@@ -1209,7 +1316,7 @@ async function init() {
   bind();
   restoreForm();
   try {
-    await Promise.all([loadWallets(), loadKeys(), loadSettings()]);
+    await Promise.all([loadWallets(), loadKeys(), loadTokens(), loadSettings()]);
   } catch (error) {
     showError(error.message);
   }
