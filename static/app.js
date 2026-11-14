@@ -50,6 +50,9 @@ const state = {
   page: 1,
   pageSize: 50,
   running: false,
+  progressFraction: 0,
+  progressDone: false,
+  progressFailed: false,
 };
 const PAGE_SIZES = [25, 50, 100, 250];
 
@@ -73,9 +76,16 @@ const ethNote = $("ethNote");
 const formError = $("formError");
 const progress = $("progress");
 const progressText = $("progressText");
+const progressPercent = $("progressPercent");
+const progressTime = $("progressTime");
+const progressDetail = $("progressDetail");
+const progressTrack = $("progressTrack");
+const progressFill = $("progressFill");
 const settingsDialog = $("settingsDialog");
 
 let controller = null;
+let progressTimer = 0;
+let progressStarted = 0;
 let sliceStart = -1;
 let sliceEnd = -1;
 let filterTimer = 0;
@@ -611,7 +621,6 @@ function renderSummary() {
     parts.push(`${absoluteAge(meta.start_time)} → ${absoluteAge(meta.end_time)}`);
   }
   parts.push(`${meta.api_calls.toLocaleString()} API calls`);
-  parts.push(`${(meta.elapsed_ms / 1000).toFixed(1)}s`);
   summary.textContent = parts.join(" · ");
   const shown = state.view.length;
   visibleCount.textContent = shown === meta.transfers
@@ -656,13 +665,125 @@ function renderChips() {
   }
 }
 
+function formatDuration(ms) {
+  const total = Math.max(0, Number(ms) || 0) / 1000;
+  if (total < 60) return `${total.toFixed(1)}s`;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = Math.round(total % 60);
+  if (hours) return `${hours}h ${minutes}m ${seconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+
+function setProgressBar(percent, complete) {
+  const pct = Math.max(0, Math.min(100, percent));
+  progressFill.style.width = `${pct}%`;
+  progressPercent.textContent = `${pct}%`;
+  progressTrack.setAttribute("aria-valuenow", String(pct));
+  progressTrack.setAttribute("aria-valuetext", complete ? `Complete, ${progressTime.textContent}` : `${pct}%`);
+}
+
+function stopProgressClock() {
+  if (progressTimer) {
+    clearInterval(progressTimer);
+    progressTimer = 0;
+  }
+}
+
+function startProgressClock() {
+  stopProgressClock();
+  progressStarted = performance.now();
+  progressTime.textContent = "0.0s";
+  progressTimer = window.setInterval(() => {
+    if (state.progressDone) return;
+    progressTime.textContent = formatDuration(performance.now() - progressStarted);
+  }, 100);
+}
+
+function beginProgress() {
+  state.progressFraction = 0;
+  state.progressDone = false;
+  state.progressFailed = false;
+  progress.hidden = false;
+  progress.classList.add("running");
+  progress.classList.remove("complete", "failed");
+  progressText.textContent = "Starting…";
+  progressDetail.textContent = "";
+  setProgressBar(0, false);
+  startProgressClock();
+}
+
+function finishProgress(meta) {
+  state.progressDone = true;
+  state.progressFailed = false;
+  stopProgressClock();
+  progress.classList.remove("running", "failed");
+  progress.classList.add("complete");
+  const count = Number(meta.transfers || 0);
+  progressText.textContent = count
+    ? `${count.toLocaleString()} transfers ready`
+    : "No transfers in this range";
+  progressTime.textContent = `Fetched in ${formatDuration(meta.elapsed_ms)}`;
+  const bits = [];
+  if (meta.start_block != null && meta.end_block != null) {
+    bits.push(`Blocks ${Number(meta.start_block).toLocaleString()}–${Number(meta.end_block).toLocaleString()}`);
+  }
+  if (meta.api_calls != null) bits.push(`${Number(meta.api_calls).toLocaleString()} API calls`);
+  progressDetail.textContent = bits.join(" · ");
+  setProgressBar(100, true);
+  progress.hidden = false;
+}
+
+function failProgress(text) {
+  state.progressFailed = true;
+  state.progressDone = false;
+  stopProgressClock();
+  progress.classList.remove("running", "complete");
+  progress.classList.add("failed");
+  progressText.textContent = "Fetch failed";
+  progressTime.textContent = formatDuration(performance.now() - progressStarted);
+  progressDetail.textContent = text || "";
+  progress.hidden = false;
+}
+
+function renderProgress(message) {
+  if (state.progressDone) return;
+  const incoming = Number(message.fraction);
+  const fraction = Math.max(state.progressFraction, Number.isFinite(incoming) ? incoming : 0);
+  state.progressFraction = fraction;
+  if (Number.isFinite(Number(message.elapsed_ms))) {
+    progressStarted = performance.now() - Number(message.elapsed_ms);
+  }
+  progressText.textContent = message.message || "Loading…";
+  const bits = [];
+  if (message.block != null && message.end_block != null) {
+    bits.push(`Block ${Number(message.block).toLocaleString()} of ${Number(message.end_block).toLocaleString()}`);
+  } else if (message.start_block != null && message.end_block != null) {
+    bits.push(`Blocks ${Number(message.start_block).toLocaleString()}–${Number(message.end_block).toLocaleString()}`);
+  }
+  if (message.detail) bits.push(message.detail);
+  else if (message.rows != null) bits.push(`${Number(message.rows).toLocaleString()} rows`);
+  progressDetail.textContent = bits.join(" · ");
+  setProgressBar(Math.min(99, Math.floor(fraction * 100)), false);
+}
+
 function setRunning(running) {
   state.running = running;
   $("trackBtn").disabled = running;
   $("stopBtn").hidden = !running;
-  progress.hidden = !running;
-  if (running) $("trackBtn").textContent = "Tracking…";
-  else $("trackBtn").textContent = "Track transfers";
+  if (running) {
+    $("trackBtn").textContent = "Tracking…";
+    beginProgress();
+  } else {
+    $("trackBtn").textContent = "Track transfers";
+    progress.classList.remove("running");
+    stopProgressClock();
+    if (!state.progressDone && !state.progressFailed && !progress.hidden) {
+      progressText.textContent = "Stopped";
+      progressTime.textContent = formatDuration(performance.now() - progressStarted);
+      progressDetail.textContent = "The fetch was stopped before it finished.";
+    }
+  }
 }
 
 async function trackTransfers(event) {
@@ -711,7 +832,6 @@ async function trackTransfers(event) {
   if (controller) controller.abort();
   controller = new AbortController();
   setRunning(true);
-  progressText.textContent = "Starting…";
   try {
     const response = await fetch("/api/track", {
       method: "POST",
@@ -740,7 +860,9 @@ async function trackTransfers(event) {
     }
     if (buffer.trim()) handleEvent(JSON.parse(buffer.trim()));
   } catch (error) {
-    if (error.name !== "AbortError") showError(error.message);
+    if (error.name === "AbortError") return;
+    failProgress(error.message);
+    showError(error.message);
   } finally {
     setRunning(false);
   }
@@ -748,14 +870,18 @@ async function trackTransfers(event) {
 
 function handleEvent(message) {
   if (message.type === "progress") {
-    progressText.textContent = message.detail ? `${message.message} · ${message.detail}` : message.message;
+    renderProgress(message);
     return;
   }
   if (message.type === "error") {
+    failProgress(message.message);
     showError(message.message);
     return;
   }
-  if (message.type === "done") showResults(message);
+  if (message.type === "done") {
+    finishProgress(message.meta || {});
+    showResults(message);
+  }
 }
 
 function saveForm() {

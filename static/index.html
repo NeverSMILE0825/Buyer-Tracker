@@ -110,8 +110,17 @@
 
       <section class="results" aria-label="Transfers">
         <div id="progress" class="progress" hidden>
-          <span class="bar"></span>
-          <p id="progressText">Loading…</p>
+          <div class="progress-top">
+            <p id="progressText">Starting…</p>
+            <p class="progress-stats">
+              <span id="progressPercent">0%</span>
+              <span id="progressTime">0.0s</span>
+            </p>
+          </div>
+          <div id="progressTrack" class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Fetch progress">
+            <span id="progressFill"></span>
+          </div>
+          <p id="progressDetail" class="progress-detail"></p>
         </div>
         <div class="summary-row">
           <p id="summary" class="summary"></p>

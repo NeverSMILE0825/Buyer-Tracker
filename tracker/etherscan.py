@@ -186,7 +186,7 @@ class EtherscanClient:
         address: str,
         start_block: int,
         end_block: int,
-        on_progress: Callable[[int], Awaitable[None]] | None = None,
+        on_progress: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         warnings: list[str] = []
 
@@ -238,17 +238,25 @@ async def walk_records(
     end: int,
     page_size: int,
     window_pages: int,
-    on_progress: Callable[[int], Awaitable[None]] | None = None,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Read every record in [start, end] despite the 10,000-row result window.
 
     Pages are sorted ascending. When a window fills up, rows from its last block
     are discarded and that block is requested again, so a block split across the
     page boundary is not truncated and is not duplicated.
+
+    on_progress receives the row count and the highest block fully covered.
+    A short page means Etherscan has no further rows, so the covered block is `end`.
     """
     collected: list[dict[str, Any]] = []
     warnings: list[str] = []
     cursor = start
+
+    async def report(rows: int, covered: int) -> None:
+        if on_progress:
+            await on_progress(rows, covered)
+
     while cursor <= end:
         window: list[dict[str, Any]] = []
         hit_end = False
@@ -258,8 +266,11 @@ async def walk_records(
             except WindowExceeded:
                 break
             window.extend(batch)
-            if on_progress:
-                await on_progress(len(collected) + len(window))
+            if window:
+                highest = max(int(row["blockNumber"]) for row in window)
+                # A full page can split its last block onto the next page.
+                covered = highest if len(batch) < page_size else highest - 1
+                await report(len(collected) + len(window), covered)
             if len(batch) < page_size:
                 hit_end = True
                 break
@@ -267,6 +278,7 @@ async def walk_records(
             raise WindowExceeded(f"No records returned before the page window for blocks {cursor}-{end}.")
         if hit_end:
             collected.extend(window)
+            await report(len(collected), end)
             break
         last_block = max(int(row["blockNumber"]) for row in window)
         if last_block <= cursor:
@@ -276,9 +288,11 @@ async def walk_records(
                 f"Block {cursor:,} has more than {cap:,} records, above Etherscan's page window. That block may be incomplete."
             )
             cursor = last_block + 1
+            await report(len(collected), cursor - 1)
             continue
         collected.extend(row for row in window if int(row["blockNumber"]) < last_block)
         cursor = last_block
+        await report(len(collected), cursor - 1)
     return collected, warnings
 
 
@@ -288,7 +302,7 @@ async def fetch_records(
     end: int,
     page_size: int,
     window_pages: int,
-    on_progress: Callable[[int], Awaitable[None]] | None = None,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
     depth: int = 0,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     try:

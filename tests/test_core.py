@@ -9,6 +9,7 @@ from tracker.analyze import build_rows, decode_universal_router, _selector
 from tracker.checksum import to_checksum_address
 from tracker.db import Database
 from tracker.etherscan import QueryTimeout, classify, fetch_records, walk_records
+from tracker.service import block_fraction
 from tracker.formatutil import clean_label, format_amount, pretty_method, sort_units, token_amount
 from tracker.labels import V4_CAPABLE_ROUTERS
 
@@ -312,6 +313,34 @@ class WalkTests(unittest.IsolatedAsyncioTestCase):
         rows, warnings = await fetch_records(fetch_page, 0, 10, 2, 2)
         self.assertEqual(sorted(int(row["blockNumber"]) for row in rows), [0, 3, 6])
         self.assertEqual(warnings, [])
+
+    async def test_progress_ends_at_the_requested_block(self):
+        seen = []
+
+        async def fetch_page(start, end, page):
+            if page > 1:
+                return []
+            return [{"blockNumber": "3"}, {"blockNumber": "8"}]
+
+        async def on_progress(rows, covered):
+            seen.append((rows, covered))
+
+        rows, warnings = await walk_records(fetch_page, 1, 20, 100, 10, on_progress)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(warnings, [])
+        self.assertEqual(seen[0], (2, 8))
+        self.assertEqual(seen[-1], (2, 20))
+        self.assertEqual([item[1] for item in seen], sorted(item[1] for item in seen))
+
+
+class FractionTests(unittest.TestCase):
+    def test_block_fraction_tracks_the_span(self):
+        self.assertEqual(block_fraction(None, 10, 19), 0)
+        self.assertEqual(block_fraction(9, 10, 19), 0)
+        self.assertEqual(block_fraction(10, 10, 19), 0.1)
+        self.assertEqual(block_fraction(19, 10, 19), 1)
+        self.assertEqual(block_fraction(40, 10, 19), 1)
+        self.assertEqual(block_fraction(7, 7, 7), 1)
 
 
 class ClientMessageTests(unittest.TestCase):

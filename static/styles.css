@@ -256,17 +256,50 @@ button:focus-visible, input:focus-visible {
   gap: 8px;
 }
 .summary-row, .warnings, .note, .tools, .progress, .banner, .pager { flex: 0 0 auto; }
-.progress { position: relative; }
-.progress .bar {
-  display: block;
-  height: 3px;
-  border-radius: 99px;
-  background: linear-gradient(90deg, transparent, var(--brass), transparent);
-  background-size: 40% 100%;
-  animation: slide 1s linear infinite;
+.progress {
+  padding: 10px 12px;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: 10px;
 }
-@keyframes slide { from { background-position: -40% 0; } to { background-position: 140% 0; } }
-#progressText { margin: 6px 0 0; color: var(--brass); font-size: 13px; }
+.progress-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+#progressText { margin: 0; color: var(--text); font-size: 13px; }
+.progress-stats {
+  margin: 0;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+#progressPercent { color: var(--brass); font-size: 13px; font-weight: 600; }
+#progressTime { color: var(--brass); font-size: 13px; }
+.progress.complete #progressTime { color: var(--text); font-weight: 600; }
+.progress-track {
+  margin-top: 8px;
+  height: 8px;
+  border-radius: 99px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+#progressFill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #8a6a2e, var(--brass));
+  transition: width 180ms ease-out;
+}
+.progress.running #progressFill {
+  background-image: linear-gradient(90deg, #8a6a2e 0%, var(--brass) 42%, #f3d48a 50%, var(--brass) 58%, #8a6a2e 100%);
+  background-size: 220% 100%;
+  animation: progressShine 1.15s linear infinite;
+}
+.progress.failed #progressFill { background: var(--danger); animation: none; }
+.progress.complete #progressFill { animation: none; }
+@keyframes progressShine { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.progress-detail { margin: 6px 0 0; color: var(--muted); font-size: 12px; min-height: 1.2em; }
 .summary-row { display: flex; justify-content: space-between; gap: 12px; }
 .summary { margin: 0; color: var(--muted); font-size: 13px; }
 

@@ -177,8 +177,15 @@ async def track_route(body: TrackIn, request: Request) -> StreamingResponse:
     async def generate():
         queue: asyncio.Queue = asyncio.Queue()
 
-        async def progress(message: str, detail: str = "") -> None:
-            await queue.put({"type": "progress", "message": message, "detail": detail})
+        async def progress(message: str, fraction: float = 0, extra: dict | None = None) -> None:
+            event: dict[str, Any] = {
+                "type": "progress",
+                "message": message,
+                "fraction": fraction,
+            }
+            if extra:
+                event.update(extra)
+            await queue.put(event)
 
         async def run() -> None:
             try:

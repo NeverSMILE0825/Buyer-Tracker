@@ -13,7 +13,74 @@ from tracker.etherscan import EtherscanClient, EtherscanError
 from tracker.formatutil import clean_label
 
 GENESIS_TS = 1_438_269_973
-Progress = Callable[[str, str], Awaitable[None]]
+# Share of the bar each phase fills. Token transfers are the long scan.
+# ETH and internal transactions run together, so they share one slice.
+RESOLVE_FRACTION = 0.05
+TOKEN_FRACTION = 0.65
+ETH_FRACTION = 0.26
+BUILD_FRACTION = 0.04
+Progress = Callable[[str, float, dict[str, Any]], Awaitable[None]]
+
+
+def block_fraction(reached: int | None, start: int, end: int) -> float:
+    """How much of the inclusive block span [start, end] is covered through `reached`."""
+    width = end - start + 1
+    if width <= 0:
+        return 1.0
+    if reached is None or reached < start:
+        return 0.0
+    covered = min(end, reached) - start + 1
+    return min(1.0, max(0.0, covered / width))
+
+
+class _FetchProgress:
+    """Turn block-cursor updates into one monotonic fraction of the whole fetch."""
+
+    def __init__(self, progress: Progress, started: float) -> None:
+        self._progress = progress
+        self._started = started
+        self.fraction = 0.0
+        self.token_rows = 0
+        self.tx_rows = 0
+        self.internal_rows = 0
+        self.tx_fraction = 0.0
+        self.internal_fraction = 0.0
+
+    async def send(self, message: str, fraction: float, **extra: Any) -> None:
+        fraction = min(1.0, max(self.fraction, fraction))
+        self.fraction = fraction
+        payload = {key: value for key, value in extra.items() if value is not None}
+        payload["elapsed_ms"] = int((time.perf_counter() - self._started) * 1000)
+        await self._progress(message, round(fraction, 4), payload)
+
+    async def token(self, rows: int, reached: int, start: int, end: int) -> None:
+        self.token_rows = max(self.token_rows, rows)
+        phase = block_fraction(reached, start, end)
+        await self.send(
+            "Reading token transfers",
+            RESOLVE_FRACTION + TOKEN_FRACTION * phase,
+            rows=self.token_rows,
+            block=min(end, max(start, reached)),
+            start_block=start,
+            end_block=end,
+        )
+
+    async def eth(self, kind: str, rows: int, reached: int, start: int, end: int) -> None:
+        phase = block_fraction(reached, start, end)
+        if kind == "tx":
+            self.tx_rows = max(self.tx_rows, rows)
+            self.tx_fraction = max(self.tx_fraction, phase)
+        else:
+            self.internal_rows = max(self.internal_rows, rows)
+            self.internal_fraction = max(self.internal_fraction, phase)
+        combined = (self.tx_fraction + self.internal_fraction) / 2
+        await self.send(
+            "Reading ETH and internal transactions",
+            RESOLVE_FRACTION + TOKEN_FRACTION + ETH_FRACTION * combined,
+            detail=f"ETH {self.tx_rows:,} rows · internal {self.internal_rows:,} rows",
+            start_block=start,
+            end_block=end,
+        )
 
 
 async def track(
@@ -28,6 +95,7 @@ async def track(
     progress: Progress,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    report = _FetchProgress(progress, started)
     wallet = normalize_address(address)
     saved = db.get_wallet(wallet)
     if saved is not None:
@@ -35,9 +103,10 @@ async def track(
     else:
         wallet_label = clean_label(label)
 
-    await progress("Resolving blocks", "")
+    await report.send("Resolving the block range", 0.02)
     resolved = await resolve_range(client, mode, start_time, end_time, start_block, end_block)
     if resolved is None:
+        await report.send("No blocks in that range", 1)
         return _payload(
             wallet,
             wallet_label,
@@ -52,20 +121,28 @@ async def track(
             started,
         )
     start, end, used_start, used_end = resolved
+    await report.send(
+        "Reading token transfers",
+        RESOLVE_FRACTION,
+        rows=0,
+        start_block=start,
+        end_block=end,
+    )
 
-    async def token_progress(count: int) -> None:
-        await progress("Fetching token transfers", f"{count:,} rows")
-
-    async def tx_progress(count: int) -> None:
-        await progress("Fetching ETH transactions", f"{count:,} rows")
-
-    async def internal_progress(count: int) -> None:
-        await progress("Fetching internal ETH", f"{count:,} rows")
+    async def token_progress(count: int, reached: int) -> None:
+        await report.token(count, reached, start, end)
 
     transfers, warnings = await client.fetch_account(
         "tokentx", wallet, start, end, token_progress
     )
     if not transfers:
+        await report.send(
+            "No token transfers in this range",
+            1,
+            rows=0,
+            start_block=start,
+            end_block=end,
+        )
         return _payload(
             wallet,
             wallet_label,
@@ -83,6 +160,19 @@ async def track(
     blocks = [int(item["blockNumber"]) for item in transfers if item.get("blockNumber")]
     span_start = min(blocks) if blocks else start
     span_end = max(blocks) if blocks else end
+    await report.send(
+        "Reading ETH and internal transactions",
+        RESOLVE_FRACTION + TOKEN_FRACTION,
+        detail="ETH 0 rows · internal 0 rows",
+        start_block=span_start,
+        end_block=span_end,
+    )
+
+    async def tx_progress(count: int, reached: int) -> None:
+        await report.eth("tx", count, reached, span_start, span_end)
+
+    async def internal_progress(count: int, reached: int) -> None:
+        await report.eth("internal", count, reached, span_start, span_end)
 
     tx_task = client.fetch_account("txlist", wallet, span_start, span_end, tx_progress)
     internal_task = client.fetch_account(
@@ -94,7 +184,13 @@ async def track(
     warnings.extend(tx_warnings)
     warnings.extend(internal_warnings)
 
-    await progress("Building the table", f"{len(transfers):,} transfers")
+    await report.send(
+        "Building the table",
+        RESOLVE_FRACTION + TOKEN_FRACTION + ETH_FRACTION + BUILD_FRACTION,
+        rows=len(transfers),
+        start_block=start,
+        end_block=end,
+    )
     rows, row_warnings = build_rows(
         wallet,
         wallet_label,
