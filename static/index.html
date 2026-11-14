@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Buyer Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23171410'/%3E%3Cpath d='M3 11.5 6.2 4h1.7L11.2 11.5H9.4l-.6-1.6H5.3l-.6 1.6H3zm2.7-3h2.7L7.1 5.7 5.7 8.5z' fill='%23e0b15a'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <h1>Buyer Tracker</h1>
+          <p>ERC-20 transfers for one wallet, loaded from the Etherscan API.</p>
+        </div>
+      </div>
+      <button type="button" class="ghost" id="settingsBtn">Settings</button>
+    </header>
+
+    <aside class="side">
+      <div class="side-head">
+        <h2>Wallets</h2>
+        <p>Save an address now and add a label later. Labels are optional.</p>
+      </div>
+      <label class="field">
+        <span>Find a saved wallet</span>
+        <input id="walletSearch" type="search" placeholder="Label or address" autocomplete="off">
+      </label>
+      <p id="walletEmpty" class="muted">No saved wallets yet.</p>
+      <ul id="walletList" class="wallet-list"></ul>
+      <p id="sideStatus" class="side-status" role="status"></p>
+
+      <div class="side-head keys-head">
+        <h2>API keys</h2>
+        <p>Save an Etherscan key and add a label later. A label is optional. The active key is the one sent to Etherscan.</p>
+      </div>
+      <label class="field">
+        <span>Etherscan API key</span>
+        <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false" placeholder="Paste a key">
+      </label>
+      <label class="check"><input id="showNewKey" type="checkbox"> Show key</label>
+      <label class="field">
+        <span>Label <em>optional</em></span>
+        <input id="apiLabel" maxlength="80" placeholder="Free tier, paid, …">
+      </label>
+      <button type="button" class="ghost" id="saveKeyBtn">Save key</button>
+      <p id="keyEmpty" class="muted">No saved keys yet.</p>
+      <ul id="keyList" class="wallet-list"></ul>
+      <p id="keyStatus" class="side-status" role="status"></p>
+    </aside>
+
+    <main class="main">
+      <form id="queryForm" class="query">
+        <div class="query-grid">
+          <label class="field grow">
+            <span>Address</span>
+            <input id="address" class="mono" list="addressList" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="0x…" required>
+            <datalist id="addressList"></datalist>
+          </label>
+          <label class="field label-field">
+            <span>Label <em>optional</em></span>
+            <input id="label" maxlength="80" placeholder="Treasury, fund, …">
+          </label>
+          <button type="button" class="ghost" id="saveBtn">Save wallet</button>
+        </div>
+
+        <div class="mode" role="tablist" aria-label="Range type">
+          <button type="button" id="modeTime" role="tab" aria-selected="true">Time range</button>
+          <button type="button" id="modeBlock" role="tab" aria-selected="false">Block range</button>
+        </div>
+
+        <div id="timeFields" class="range">
+          <label class="field">
+            <span>Start</span>
+            <input id="startTime" type="datetime-local" step="1">
+          </label>
+          <label class="field">
+            <span>End</span>
+            <input id="endTime" type="datetime-local" step="1">
+          </label>
+        </div>
+        <div id="blockFields" class="range" hidden>
+          <label class="field">
+            <span>Start block</span>
+            <input id="startBlock" class="mono" inputmode="numeric" placeholder="21000000">
+          </label>
+          <label class="field">
+            <span>End block</span>
+            <input id="endBlock" class="mono" inputmode="numeric" placeholder="21072000">
+          </label>
+        </div>
+
+        <div class="actions">
+          <button type="submit" class="primary" id="trackBtn">Track transfers</button>
+          <button type="button" class="ghost danger" id="stopBtn" hidden>Stop</button>
+          <p id="formError" class="error" role="alert" hidden></p>
+        </div>
+      </form>
+
+      <div id="keyBanner" class="banner" hidden>
+        <p>Add an Etherscan API key before loading transfers. It stays on this computer.</p>
+        <button type="button" class="ghost" id="addKey">Add a key</button>
+      </div>
+
+      <section class="results" aria-label="Transfers">
+        <div id="progress" class="progress" hidden>
+          <span class="bar"></span>
+          <p id="progressText">Loading…</p>
+        </div>
+        <div class="summary-row">
+          <p id="summary" class="summary"></p>
+          <p id="visibleCount" class="summary"></p>
+        </div>
+        <div id="warnings" class="warnings" hidden></div>
+        <p id="ethNote" class="note" hidden>Amount (ETH) is this wallet’s net ETH plus WETH for that transaction. Every token row from the same hash shares it, so don’t add the column down the table. Count is the number of transactions that moved that token in the selected range.</p>
+
+        <div class="tools">
+          <label class="field filter-field">
+            <span>Filter rows</span>
+            <input id="filter" type="search" placeholder="Uniswap V3, Tether USD (USDT), USDC (USDC)…" autocomplete="off">
+          </label>
+          <div id="chipRow" class="chips" aria-label="Quick filters"></div>
+          <div class="tool-toggles">
+            <label class="check"><input id="hideZero" type="checkbox"> Hide zero amounts</label>
+            <div class="age-toggle" role="group" aria-label="Age format">
+              <span>Age</span>
+              <button type="button" id="ageRelative" aria-pressed="true">Relative</button>
+              <button type="button" id="ageAbsolute" aria-pressed="false">Absolute</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="tableWrap" class="table-wrap">
+          <div id="thead" class="thead grid" role="row"></div>
+          <div id="spacer" class="spacer">
+            <div id="window" class="window" role="rowgroup"></div>
+          </div>
+          <p id="emptyResults" class="empty-results">Track a wallet to see its ERC-20 transfers.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="settingsDialog">
+    <form id="settingsForm">
+      <header>
+        <h2>Settings</h2>
+        <p>API keys are saved in the sidebar. They stay in a local database and are only sent to Etherscan.</p>
+      </header>
+      <div class="range">
+        <label class="field">
+          <span>Calls per second</span>
+          <input id="rate" type="number" min="1" max="30" step="0.5">
+        </label>
+        <label class="field">
+          <span>Records per request</span>
+          <input id="pageSize" type="number" min="100" max="10000" step="100">
+        </label>
+      </div>
+      <p class="muted">Free tier is 3 calls/second and 1,000 records. A paid plan can use a larger page size, which makes busy wallets faster. Ethereum mainnet only.</p>
+      <p id="settingsError" class="error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="submit" class="primary" id="saveSettings">Save settings</button>
+        <button type="button" class="ghost" id="closeSettings">Close</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>

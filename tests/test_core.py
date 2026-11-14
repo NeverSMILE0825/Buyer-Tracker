@@ -1,0 +1,439 @@
+import json
+import sqlite3
+import tempfile
+import unittest
+from decimal import Decimal
+from pathlib import Path
+
+from tracker.analyze import build_rows, decode_universal_router, _selector
+from tracker.checksum import to_checksum_address
+from tracker.db import Database
+from tracker.etherscan import QueryTimeout, classify, fetch_records, walk_records
+from tracker.formatutil import clean_label, format_amount, pretty_method, sort_units, token_amount
+from tracker.labels import V4_CAPABLE_ROUTERS
+
+WALLET = "0x" + "11" * 20
+OTHER = "0x" + "22" * 20
+POOL = "0x" + "33" * 20
+USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+V2 = "0x7a250d5630b4cf539739df2c5dacb4c659f2488d"
+V3 = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
+V4 = "0x000000000004444c5dc75cb358380d2e3de08a90"
+UR = "0x66a9893cc07d91d95644aedd05d03f95e1dba8af"
+HASH = "0x" + "ab" * 32
+HASH_B = "0x" + "cd" * 32
+
+
+def transfer(**overrides):
+    row = {
+        "blockNumber": "100",
+        "timeStamp": "1700000000",
+        "hash": HASH,
+        "from": OTHER,
+        "to": WALLET,
+        "value": "176720000",
+        "contractAddress": USDT,
+        "tokenName": "Tether USD",
+        "tokenSymbol": "USDT",
+        "tokenDecimal": "6",
+        "transactionIndex": "1",
+        "methodId": "0x38ed1739",
+        "functionName": "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+        "statusRep": "1",
+    }
+    row.update(overrides)
+    return row
+
+
+def tx(hash_=HASH, value="0", to=V3, is_error="0", input_data="0x"):
+    return {
+        "hash": hash_,
+        "from": WALLET,
+        "to": to,
+        "value": value,
+        "isError": is_error,
+        "input": input_data,
+        "functionName": "exactInputSingle(tuple)",
+        "methodId": "0x414bf389",
+        "blockNumber": "100",
+    }
+
+
+def execute_calldata(commands: bytes) -> str:
+    selector = _selector("execute(bytes,bytes[],uint256)")
+    head = (96).to_bytes(32, "big") + (0).to_bytes(32, "big") + (1).to_bytes(32, "big")
+    pad = bytes((32 - len(commands) % 32) % 32)
+    body = len(commands).to_bytes(32, "big") + commands + pad
+    return "0x" + selector + (head + body).hex()
+
+
+class FormatTests(unittest.TestCase):
+    def test_token_amount_is_exact(self):
+        self.assertEqual(format_amount(token_amount("176720000", 6)), "176.72")
+        self.assertEqual(format_amount(token_amount("1", 18)), "0.000000000000000001")
+        self.assertEqual(format_amount(Decimal("1000.5")), "1,000.5")
+        self.assertEqual(format_amount(Decimal("-1.5")), "-1.5")
+        self.assertEqual(format_amount(Decimal("0")), "0")
+
+    def test_sort_units_keep_order(self):
+        self.assertLess(int(sort_units(Decimal("-2"))), int(sort_units(Decimal("-1"))))
+        self.assertLess(int(sort_units(Decimal("1"))), int(sort_units(Decimal("1.5"))))
+
+    def test_pretty_method(self):
+        self.assertEqual(pretty_method("swapExactETHForTokens(uint256,address[],address,uint256)"), "Swap Exact ETH For Tokens")
+        self.assertEqual(pretty_method("transferAndMulticall(address,uint256,bytes)"), "Transfer And Multicall")
+        self.assertEqual(pretty_method("transfer(address,uint256)"), "Transfer")
+
+    def test_label_length(self):
+        self.assertEqual(clean_label("  desk  "), "desk")
+        with self.assertRaises(ValueError):
+            clean_label("x" * 81)
+
+
+class ChecksumTests(unittest.TestCase):
+    def test_eip55_vectors(self):
+        vectors = [
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+            "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB",
+            "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
+        ]
+        for vector in vectors:
+            self.assertEqual(to_checksum_address(vector.lower()), vector)
+
+    def test_rejects_short_address(self):
+        with self.assertRaises(ValueError):
+            to_checksum_address("0x1234")
+
+
+class AnalyzeTests(unittest.TestCase):
+    def test_eth_spent_and_token_in(self):
+        rows, warnings = build_rows(
+            WALLET,
+            "Desk",
+            {},
+            [transfer()],
+            [tx(value=str(10**18), to=V3)],
+            [],
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["amount_token"], "176.72")
+        self.assertEqual(row["amount_eth"], "-1")
+        self.assertEqual(row["direction"], "in")
+        self.assertEqual(row["token"], "Tether USD (USDT)")
+        self.assertEqual(row["protocol"], "Uniswap V3")
+        self.assertEqual(row["method"], "Swap Exact Tokens For Tokens")
+        self.assertEqual(row["to_label"], "Desk")
+        self.assertEqual(row["count"], 1)
+        self.assertIn("uniswap v3", row["token"].lower() + row["protocol"].lower())
+
+    def test_weth_and_internal_and_unrelated_internal(self):
+        weth_out = transfer(
+            from_=None,
+            contractAddress=WETH,
+            tokenName="Wrapped Ether",
+            tokenSymbol="WETH",
+            tokenDecimal="18",
+            value=str(5 * 10**17),
+            **{"from": WALLET, "to": POOL},
+        )
+        usdc_in = transfer(
+            hash=HASH,
+            contractAddress=USDC,
+            tokenName="USD Coin",
+            tokenSymbol="USDC",
+            tokenDecimal="6",
+            value="25000000",
+            transactionIndex="2",
+            **{"from": POOL, "to": WALLET},
+        )
+        rows, _ = build_rows(
+            WALLET,
+            "",
+            {},
+            [weth_out, usdc_in],
+            [tx(value="0", to=V2)],
+            [
+                {"hash": HASH, "from": V2, "to": WETH, "value": str(10**18), "isError": "0"},
+                {"hash": HASH, "from": POOL, "to": WALLET, "value": str(2 * 10**17), "isError": "0"},
+            ],
+        )
+        self.assertEqual({row["amount_eth"] for row in rows}, {"-0.3"})
+        usdc = next(row for row in rows if row["token_symbol"] == "USDC")
+        self.assertEqual(usdc["amount_token"], "25")
+        self.assertEqual(usdc["protocol"], "Uniswap V2")
+        self.assertEqual(usdc["count"], 1)
+
+    def test_wrap_nets_to_zero_and_failed_tx_is_ignored(self):
+        minted = transfer(
+            contractAddress=WETH,
+            tokenName="Wrapped Ether",
+            tokenSymbol="WETH",
+            tokenDecimal="18",
+            value=str(10**18),
+            **{"from": WETH, "to": WALLET},
+        )
+        rows, _ = build_rows(
+            WALLET,
+            "",
+            {},
+            [minted],
+            [tx(value=str(10**18), to=WETH, is_error="0")],
+            [],
+        )
+        self.assertEqual(rows[0]["amount_eth"], "0")
+
+        rows, _ = build_rows(
+            WALLET,
+            "",
+            {},
+            [transfer()],
+            [tx(value=str(10**18), to=V3, is_error="1")],
+            [],
+        )
+        self.assertEqual(rows[0]["amount_eth"], "0")
+
+    def test_count_is_distinct_transactions_per_token(self):
+        rows, _ = build_rows(
+            WALLET,
+            "",
+            {},
+            [
+                transfer(hash=HASH, transactionIndex="1"),
+                transfer(hash=HASH, transactionIndex="2", value="1"),
+                transfer(hash=HASH_B, blockNumber="101", timeStamp="1700000012"),
+                transfer(
+                    hash=HASH_B,
+                    blockNumber="101",
+                    contractAddress=USDC,
+                    tokenName="USD Coin",
+                    tokenSymbol="USDC",
+                    tokenDecimal="6",
+                    value="1000000",
+                ),
+            ],
+            [],
+            [],
+        )
+        usdt = [row for row in rows if row["token_symbol"] == "USDT"]
+        usdc = [row for row in rows if row["token_symbol"] == "USDC"]
+        self.assertEqual({row["count"] for row in usdt}, {2})
+        self.assertEqual(usdc[0]["count"], 1)
+        self.assertEqual(len(usdt), 3)
+
+    def test_user_label_overrides_known_and_v4_tag(self):
+        labeled = to_checksum_address(V4)
+        rows, _ = build_rows(
+            WALLET,
+            "",
+            {labeled: "Main pool"},
+            [transfer(**{"from": V4, "to": WALLET})],
+            [],
+            [],
+        )
+        self.assertEqual(rows[0]["from_label"], "Main pool")
+        self.assertIn("Uniswap V4", rows[0]["protocol"])
+
+    def test_universal_router_commands(self):
+        self.assertEqual(_selector("execute(bytes,bytes[],uint256)"), "3593564c")
+        self.assertIn(UR.lower(), V4_CAPABLE_ROUTERS)
+        data = execute_calldata(bytes([0x00, 0x08, 0x90]))
+        self.assertEqual(
+            decode_universal_router(data, v4_capable=True),
+            ["Uniswap V3", "Uniswap V2", "Uniswap V4"],
+        )
+        self.assertEqual(
+            decode_universal_router(data, v4_capable=False),
+            ["Uniswap V3", "Uniswap V2"],
+        )
+        rows, _ = build_rows(
+            WALLET,
+            "",
+            {},
+            [transfer()],
+            [tx(to=UR, input_data=data)],
+            [],
+        )
+        self.assertEqual(rows[0]["protocol"], "Uniswap V2, Uniswap V3, Uniswap V4")
+
+    def test_zero_and_unsafe(self):
+        rows, _ = build_rows(
+            WALLET,
+            "",
+            {},
+            [transfer(value="0", statusRep="2")],
+            [],
+            [],
+        )
+        self.assertTrue(rows[0]["zero"])
+        self.assertTrue(rows[0]["unsafe"])
+        self.assertEqual(rows[0]["amount_token"], "0")
+
+
+class WalkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_window_keeps_boundary_block_once(self):
+        blocks = [100, 101, 102, 103, 103, 104, 150]
+        records = [{"blockNumber": str(block), "n": index} for index, block in enumerate(blocks)]
+
+        async def fetch_page(start, end, page):
+            matched = [row for row in records if start <= int(row["blockNumber"]) <= end]
+            offset = (page - 1) * 2
+            return matched[offset : offset + 2]
+
+        rows, warnings = await walk_records(fetch_page, 100, 200, 2, 2)
+        self.assertEqual([row["n"] for row in rows], list(range(7)))
+        self.assertEqual(warnings, [])
+
+    async def test_single_block_over_the_window_warns(self):
+        records = [{"blockNumber": "5", "n": index} for index in range(5)]
+
+        async def fetch_page(start, end, page):
+            matched = [row for row in records if start <= int(row["blockNumber"]) <= end]
+            offset = (page - 1) * 2
+            return matched[offset : offset + 2]
+
+        rows, warnings = await walk_records(fetch_page, 5, 5, 2, 2)
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(warnings)
+        self.assertIn("Block 5", warnings[0])
+
+    async def test_timeout_splits_the_range(self):
+        async def fetch_page(start, end, page):
+            if page > 1:
+                return []
+            if end - start > 4:
+                raise QueryTimeout("slow")
+            return [{"blockNumber": str(start)}]
+
+        rows, warnings = await fetch_records(fetch_page, 0, 10, 2, 2)
+        self.assertEqual(sorted(int(row["blockNumber"]) for row in rows), [0, 3, 6])
+        self.assertEqual(warnings, [])
+
+
+class ClientMessageTests(unittest.TestCase):
+    def test_classify(self):
+        self.assertEqual(classify("No transactions found", []), "empty")
+        self.assertEqual(classify("NOTOK", "Max rate limit reached"), "rate")
+        self.assertEqual(classify("NOTOK", "Free tier is limited to 1000 records"), "pagesize")
+        self.assertEqual(classify("NOTOK", "Result window is too large"), "window")
+        self.assertEqual(classify("NOTOK", "Invalid API Key"), "key")
+
+
+class DatabaseTests(unittest.TestCase):
+    def test_save_label_is_optional_and_checksummed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "tracker.db")
+            saved = database.save_wallet(WALLET, "")
+            self.assertEqual(saved["address"], to_checksum_address(WALLET))
+            self.assertEqual(saved["label"], "")
+            self.assertEqual(database.label_map(), {})
+            updated = database.save_wallet(WALLET.lower(), "Desk")
+            self.assertEqual(updated["label"], "Desk")
+            self.assertEqual(len(database.wallets()), 1)
+            self.assertTrue(database.delete_wallet(saved["address"]))
+            self.assertEqual(database.wallets(), [])
+            database._conn.close()
+
+    def test_api_keys_are_saved_masked_and_one_is_active(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "tracker.db")
+            first = database.save_api_key("FreeKey12345678", "")
+            self.assertEqual(first["label"], "")
+            self.assertTrue(first["active"])
+            self.assertEqual(first["hint"], "Free…5678")
+            self.assertNotIn("key", first)
+            second = database.save_api_key("PaidKey12345678", "Paid plan")
+            listed = database.api_keys()
+            self.assertEqual(len(listed), 2)
+            self.assertNotIn("FreeKey12345678", json.dumps(listed))
+            self.assertNotIn("PaidKey12345678", json.dumps(listed))
+            active = [item for item in listed if item["active"]]
+            self.assertEqual(active, [second])
+            self.assertEqual(database.api_key(), "PaidKey12345678")
+            switched = database.activate_api_key(first["id"])
+            self.assertTrue(switched["active"])
+            self.assertEqual(database.api_key(), "FreeKey12345678")
+            self.assertTrue(database.delete_api_key(first["id"]))
+            self.assertEqual(database.api_key(), "")
+            with self.assertRaises(ValueError):
+                database.save_api_key("short", "")
+            database._conn.close()
+
+    def test_legacy_settings_key_is_migrated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tracker.db"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("INSERT INTO settings (key, value) VALUES ('api_key', 'LegacyKey123456')")
+            conn.commit()
+            conn.close()
+            database = Database(path)
+            self.assertEqual(database.api_key(), "LegacyKey123456")
+            self.assertEqual(database.get_setting("api_key", ""), "")
+            listed = database.api_keys()
+            self.assertEqual(len(listed), 1)
+            self.assertNotIn("LegacyKey123456", json.dumps(listed))
+            database._conn.close()
+
+
+class ApiTests(unittest.TestCase):
+    def test_wallet_and_track_without_key(self):
+        from fastapi.testclient import TestClient
+
+        from app import app
+        from tracker.db import db
+
+        address = to_checksum_address("0x" + "44" * 20)
+        secret = "HttpTestKey123456"
+        with TestClient(app) as client:
+            created_id = None
+            previous = None
+            try:
+                created = client.post("/api/wallets", json={"address": address, "label": ""})
+                self.assertEqual(created.status_code, 200)
+                self.assertEqual(created.json()["label"], "")
+                listed = client.get("/api/wallets")
+                self.assertTrue(any(item["address"] == created.json()["address"] for item in listed.json()))
+                renamed = client.post("/api/wallets", json={"address": address, "label": "Cold"})
+                self.assertEqual(renamed.json()["label"], "Cold")
+                before = client.get("/api/keys")
+                self.assertEqual(before.status_code, 200)
+                previous = next((item["id"] for item in before.json() if item["active"]), None)
+                saved = client.post("/api/keys", json={"key": secret, "label": "CI"})
+                self.assertEqual(saved.status_code, 200)
+                created_id = saved.json()["id"]
+                self.assertEqual(saved.json()["label"], "CI")
+                self.assertNotIn(secret, saved.text)
+                keys = client.get("/api/keys")
+                self.assertNotIn(secret, keys.text)
+                self.assertIn("API keys", client.get("/").text)
+                removed = client.delete(f"/api/keys/{created_id}")
+                self.assertEqual(removed.status_code, 200)
+                created_id = None
+                if previous is not None:
+                    client.post(f"/api/keys/{previous}/activate")
+                if not db.api_key():
+                    missing = client.post("/api/track", json={
+                        "address": address,
+                        "mode": "block",
+                        "start_block": 1,
+                        "end_block": 2,
+                    })
+                    self.assertEqual(missing.status_code, 200)
+                    event = json.loads(missing.text.strip().splitlines()[-1])
+                    self.assertEqual(event["type"], "error")
+                    self.assertIn("API key", event["message"])
+            finally:
+                db.delete_wallet(address)
+                if created_id is not None:
+                    db.delete_api_key(created_id)
+                if previous is not None:
+                    db.activate_api_key(previous)
+
+
+if __name__ == "__main__":
+    unittest.main()

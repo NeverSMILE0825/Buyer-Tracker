@@ -1,0 +1,14 @@
+---
+description: After codebase updates, commit and push to the Buyer Tracker GitHub repo
+alwaysApply: true
+---
+
+# Push Buyer Tracker updates
+
+After you change this codebase, commit the update and push it to https://github.com/NeverSMILE0825/Buyer-Tracker.git.
+
+- Remote: `origin` → `https://github.com/NeverSMILE0825/Buyer-Tracker.git`
+- Push the current branch. Do not force-push.
+- Never commit `data/`, `.venv/`, `tracker.db`, `.env`, or any Etherscan API key. Keys stay in the local SQLite database only.
+- Do not change git config. Do not skip hooks.
+- If the push fails, say so and leave the commit in place.
