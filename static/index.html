@@ -87,10 +87,13 @@
             <span>Start block</span>
             <input id="startBlock" class="mono" inputmode="numeric" placeholder="21000000">
           </label>
-          <label class="field">
-            <span>End block</span>
-            <input id="endBlock" class="mono" inputmode="numeric" placeholder="21072000">
-          </label>
+          <div class="field">
+            <label for="endBlock">End block</label>
+            <span class="end-block">
+              <input id="endBlock" class="mono" inputmode="numeric" placeholder="21072000">
+              <button type="button" class="ghost" id="latestBlockBtn">Latest</button>
+            </span>
+          </div>
         </div>
 
         <div class="actions">

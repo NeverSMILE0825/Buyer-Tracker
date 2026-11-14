@@ -318,6 +318,21 @@ async function fillBlocks() {
   }
 }
 
+async function fillLatestBlock() {
+  const button = $("latestBlockBtn");
+  button.disabled = true;
+  try {
+    const data = await getJSON("/api/latest-block");
+    $("endBlock").value = String(data.block);
+    showError("");
+    saveForm();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function loadSettings() {
   const data = await getJSON("/api/settings");
   $("rate").value = data.rate;
@@ -797,6 +812,9 @@ function bind() {
   });
   $("modeTime").addEventListener("click", () => setMode("time"));
   $("modeBlock").addEventListener("click", () => setMode("block"));
+  $("latestBlockBtn").addEventListener("click", () => {
+    fillLatestBlock().catch((error) => showError(error.message));
+  });
   $("stopBtn").addEventListener("click", () => controller && controller.abort());
   $("settingsBtn").addEventListener("click", openSettings);
   $("addKey").addEventListener("click", focusKeyForm);
