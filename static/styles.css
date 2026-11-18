@@ -21,9 +21,9 @@
   --neg: #e7a06a;
   --shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
   --row-h: 52px;
-  --grid: 148px 220px 104px 168px 200px 200px 150px 138px 220px 76px;
+  --grid: 150px 148px 220px 104px 168px 200px 200px 150px 138px 220px 76px;
   --gap: 12px;
-  --table-w: calc(148px + 220px + 104px + 168px + 200px + 200px + 150px + 138px + 220px + 76px + 9 * 12px + 24px);
+  --table-w: calc(150px + 148px + 220px + 104px + 168px + 200px + 200px + 150px + 138px + 220px + 76px + 10 * 12px + 24px);
   font-family: "Segoe UI", "Avenir Next", sans-serif;
 }
 

@@ -290,6 +290,8 @@ def build_rows(
         rows.append(
             {
                 "seq": seq,
+                "wallet": wallet,
+                "wallet_label": wallet_label or "",
                 "hash": item["hash"],
                 "method": method,
                 "method_raw": method_raw,

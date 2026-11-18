@@ -416,6 +416,50 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(database.wallets(), [])
             database._conn.close()
 
+    def test_wallets_can_be_enabled_together(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "tracker.db")
+            first = database.save_wallet(WALLET, "Desk")
+            second = database.save_wallet(OTHER, "Fund")
+            self.assertTrue(first["enabled"])
+            self.assertTrue(second["enabled"])
+            self.assertEqual([item["address"] for item in database.wallets() if item["enabled"]], [
+                to_checksum_address(WALLET),
+                to_checksum_address(OTHER),
+            ])
+            disabled = database.set_wallet_enabled(first["address"], False)
+            self.assertFalse(disabled["enabled"])
+            enabled = [item["label"] for item in database.wallets() if item["enabled"]]
+            self.assertEqual(enabled, ["Fund"])
+            renamed = database.save_wallet(first["address"], "Desk")
+            self.assertTrue(renamed["enabled"])
+            self.assertIsNone(database.set_wallet_enabled("0x" + "99" * 20, True))
+            database._conn.close()
+
+    def test_saved_wallets_stay_enabled_when_the_column_is_added(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tracker.db"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                """
+                CREATE TABLE wallets (
+                    address TEXT PRIMARY KEY,
+                    label TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO wallets (address, label, created_at, updated_at) VALUES (?, 'Old', 1, 1)",
+                (to_checksum_address(WALLET),),
+            )
+            conn.commit()
+            conn.close()
+            database = Database(path)
+            self.assertTrue(database.wallets()[0]["enabled"])
+            database._conn.close()
+
     def test_notify_tokens_keep_a_label_when_the_symbol_is_refreshed(self):
         with tempfile.TemporaryDirectory() as folder:
             database = Database(Path(folder) / "tracker.db")

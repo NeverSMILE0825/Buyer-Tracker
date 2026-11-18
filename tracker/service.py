@@ -93,6 +93,113 @@ class _FetchProgress:
             )
 
 
+async def track_many(
+    client: KeyPool,
+    addresses: list[str],
+    label: str,
+    mode: str,
+    start_time: int | None,
+    end_time: int | None,
+    start_block: int | None,
+    end_block: int | None,
+    progress: Progress,
+) -> dict[str, Any]:
+    """Load every selected wallet for the same range and return one table."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in addresses:
+        wallet = normalize_address(raw)
+        if wallet.lower() in seen:
+            continue
+        seen.add(wallet.lower())
+        ordered.append(wallet)
+    if not ordered:
+        raise ValueError("Turn on a saved wallet, or enter an address.")
+    if len(ordered) == 1:
+        saved = db.get_wallet(ordered[0])
+        return await track(
+            client,
+            ordered[0],
+            saved["label"] if saved and saved["label"] else label,
+            mode,
+            start_time,
+            end_time,
+            start_block,
+            end_block,
+            progress,
+        )
+
+    started = time.perf_counter()
+    calls_before = client.calls
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    cached_blocks = 0
+    fetched_blocks = 0
+    wallets: list[dict[str, str]] = []
+    start = end = used_start = used_end = None
+    count = len(ordered)
+    for index, wallet in enumerate(ordered):
+        saved = db.get_wallet(wallet)
+        wallet_label = str(saved["label"]) if saved and saved["label"] else ""
+        name = wallet_label or f"{wallet[:6]}…{wallet[-4:]}"
+
+        async def scaled(
+            message: str,
+            fraction: float,
+            extra: dict[str, Any],
+            index: int = index,
+            name: str = name,
+        ) -> None:
+            payload = dict(extra or {})
+            payload["wallet_index"] = index + 1
+            payload["wallet_count"] = count
+            await progress(f"{name} · {message}", (index + float(fraction)) / count, payload)
+
+        payload = await track(
+            client,
+            wallet,
+            wallet_label,
+            mode,
+            start_time,
+            end_time,
+            start_block,
+            end_block,
+            scaled,
+        )
+        meta = payload["meta"]
+        rows.extend(payload["rows"])
+        for warning in meta["warnings"]:
+            warnings.append(f"{name}: {warning}")
+        cached_blocks += int(meta["cached_blocks"])
+        fetched_blocks += int(meta["fetched_blocks"])
+        wallets.append({"address": meta["address"], "label": meta["label"]})
+        if meta["start_block"] is not None:
+            start = meta["start_block"]
+            end = meta["end_block"]
+            used_start = meta["start_time"]
+            used_end = meta["end_time"]
+    for seq, row in enumerate(rows):
+        row["seq"] = seq
+    combined = _payload(
+        ordered[0],
+        wallets[0]["label"],
+        mode,
+        start,
+        end,
+        used_start if used_start is not None else start_time,
+        used_end if used_end is not None else end_time,
+        rows,
+        warnings,
+        client.calls - calls_before,
+        started,
+        client.key_count,
+        cached_blocks,
+        fetched_blocks,
+    )
+    combined["meta"]["wallets"] = wallets
+    return combined
+
+
 async def track(
     client: KeyPool,
     address: str,
@@ -289,6 +396,7 @@ def _payload(
         "meta": {
             "address": wallet,
             "label": label,
+            "wallets": [{"address": wallet, "label": label}],
             "mode": mode,
             "start_block": start_block,
             "end_block": end_block,

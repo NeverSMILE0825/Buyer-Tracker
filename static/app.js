@@ -1,5 +1,6 @@
 const ROW_H = 52;
 const COLUMNS = [
+  { id: "wallet", label: "Wallet", kind: "text" },
   { id: "hash", label: "Tx Hash", kind: "text" },
   { id: "method", label: "Method", kind: "text" },
   { id: "block", label: "Block", kind: "number", align: "num" },
@@ -12,6 +13,7 @@ const COLUMNS = [
   { id: "count", label: "Count", kind: "number", align: "num" },
 ];
 const TIPS = {
+  wallet: "The monitored wallet this transfer belongs to.",
   hash: "Sort by transaction hash.",
   method: "Sort by method and protocol.",
   block: "Sort by block number.",
@@ -21,7 +23,7 @@ const TIPS = {
   amount_token: "ERC-20 amount moved in this transfer.",
   amount_eth: "Net ETH plus WETH for this wallet in the whole transaction. Rows that share a hash share this value.",
   token: "Sort by token name.",
-  count: "Distinct transactions that moved this token in the selected range.",
+  count: "Distinct transactions that moved this token for that wallet in the selected range.",
 };
 const CHIPS = [
   { id: "v2", label: "Uniswap V2", test: (row) => row.protocol.includes("Uniswap V2") || row.search.includes("uniswap v2") },
@@ -57,10 +59,7 @@ const state = {
   notify: false,
   notifyFilter: false,
   tokens: [],
-  seenReady: false,
-  seenAddress: "",
-  seenHashes: new Set(),
-  seenMaxBlock: 0,
+  seenByWallet: {},
 };
 const PAGE_SIZES = [25, 50, 100, 250];
 
@@ -179,7 +178,8 @@ function renderWallets() {
   walletEmpty.hidden = items.length !== 0;
   for (const wallet of items) {
     const item = document.createElement("li");
-    item.className = "wallet" + (wallet.address.toLowerCase() === selected ? " selected" : "");
+    const on = wallet.enabled !== false;
+    item.className = "wallet key-row" + (on ? " on" : " off") + (wallet.address.toLowerCase() === selected ? " selected" : "");
     const pick = document.createElement("button");
     pick.type = "button";
     pick.className = "wallet-pick";
@@ -191,12 +191,22 @@ function renderWallets() {
     sub.textContent = wallet.label ? wallet.address : "No label";
     pick.append(name, sub);
     pick.addEventListener("click", () => selectWallet(wallet));
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "key-toggle";
+    toggle.textContent = on ? "On" : "Off";
+    toggle.setAttribute("aria-pressed", String(on));
+    const title = wallet.label || shortAddr(wallet.address);
+    toggle.setAttribute("aria-label", `${on ? "Disable" : "Enable"} ${title}`);
+    toggle.addEventListener("click", () => setWalletEnabled(wallet, !on).catch((error) => {
+      sideStatus.textContent = error.message;
+    }));
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "icon-btn";
     remove.textContent = "Remove";
     remove.addEventListener("click", () => removeWallet(wallet));
-    item.append(pick, remove);
+    item.append(pick, toggle, remove);
     walletList.append(item);
   }
   const list = $("addressList");
@@ -219,6 +229,17 @@ function selectWallet(wallet) {
   labelInput.value = wallet.label || "";
   renderWallets();
   saveForm();
+}
+
+async function setWalletEnabled(wallet, enabled) {
+  await getJSON(`/api/wallets/${encodeURIComponent(wallet.address)}/enabled`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+  const title = wallet.label || shortAddr(wallet.address);
+  sideStatus.textContent = enabled ? `${title} on` : `${title} off`;
+  await loadWallets();
 }
 
 async function removeWallet(wallet) {
@@ -405,7 +426,7 @@ async function saveSettings(event) {
 function buildSearch(row) {
   const symbol = row.token_symbol || "";
   const bits = [
-    row.hash, row.method, row.method_raw, row.protocol, row.block,
+    row.wallet, row.wallet_label, row.hash, row.method, row.method_raw, row.protocol, row.block,
     row.from, row.from_label, row.to, row.to_label,
     row.token, row.token_name, row.token_symbol, row.token_contract,
     row.amount_token, row.amount_token_exact, row.amount_eth, row.amount_eth_exact,
@@ -413,6 +434,10 @@ function buildSearch(row) {
   ];
   if (symbol) bits.push(`${symbol} (${symbol})`);
   row.search = bits.join(" ").toLowerCase();
+}
+
+function walletName(row) {
+  return (row.wallet_label || row.wallet || "").toLowerCase();
 }
 
 function partyName(row, side) {
@@ -430,6 +455,7 @@ function cmpBig(a, b) {
 function compare(a, b) {
   let primary = 0;
   switch (state.sortCol) {
+    case "wallet": primary = walletName(a).localeCompare(walletName(b)); break;
     case "hash": primary = a.hash.localeCompare(b.hash); break;
     case "method": primary = `${a.method} ${a.protocol}`.localeCompare(`${b.method} ${b.protocol}`); break;
     case "block": primary = a.block - b.block; break;
@@ -586,7 +612,12 @@ function renderRow(row) {
     ? `<button type="button" class="proto-btn" data-filter="${esc(row.protocol)}">${esc(row.protocol)}</button>`
     : "";
   const unsafe = row.unsafe ? '<span class="unsafe" title="Etherscan marks this token unsafe">UNSAFE</span>' : "";
+  const walletText = row.wallet_label || shortAddr(row.wallet);
+  const walletHtml = row.wallet
+    ? `<button type="button" class="token-btn" data-filter="${esc(walletText)}" title="${esc(row.wallet)}">${esc(walletText)}</button>`
+    : "";
   return `<div class="row grid" role="row">
+    <div class="cell">${walletHtml}</div>
     <div class="cell">${hashHtml}</div>
     <div class="cell method" title="${esc(row.method_raw || row.method)}"><span class="method-line">${esc(row.method)}</span>${protocol}</div>
     <div class="cell num">${row.block.toLocaleString()}</div>
@@ -616,7 +647,7 @@ function paint(force) {
       ? "No rows match this filter."
       : state.loaded
         ? "No ERC-20 transfers in that range."
-        : "Track a wallet to see its ERC-20 transfers.";
+        : "Turn on a saved wallet, or enter an address, to see ERC-20 transfers.";
     return;
   }
   emptyResults.hidden = true;
@@ -644,6 +675,8 @@ function renderSummary() {
     `${meta.transfers.toLocaleString()} transfers`,
     `${meta.tokens.toLocaleString()} tokens`,
   ];
+  const names = (meta.wallets || []).map((wallet) => wallet.label || shortAddr(wallet.address)).filter(Boolean);
+  if (names.length > 1) parts.splice(1, 0, names.join(", "));
   if (meta.start_block != null && meta.end_block != null) {
     parts.push(`blocks ${Number(meta.start_block).toLocaleString()}–${Number(meta.end_block).toLocaleString()}`);
   }
@@ -768,6 +801,7 @@ function finishProgress(meta) {
     bits.push(`${Number(meta.fetched_blocks).toLocaleString()} fetched`);
   }
   if (meta.api_calls != null) bits.push(`${Number(meta.api_calls).toLocaleString()} API calls`);
+  if (Number(meta.wallets && meta.wallets.length) > 1) bits.push(`${meta.wallets.length} wallets`);
   if (Number(meta.keys) > 1) bits.push(`${Number(meta.keys)} keys`);
   progressDetail.textContent = bits.join(" · ");
   setProgressBar(100, true);
@@ -805,6 +839,9 @@ function renderProgress(message) {
   }
   if (message.detail) bits.push(message.detail);
   else if (message.rows != null) bits.push(`${Number(message.rows).toLocaleString()} rows`);
+  if (Number(message.wallet_count) > 1) {
+    bits.push(`Wallet ${Number(message.wallet_index)} of ${Number(message.wallet_count)}`);
+  }
   if (Number(message.keys) > 1) bits.push(`${Number(message.keys)} keys`);
   progressDetail.textContent = bits.join(" · ");
   setProgressBar(Math.min(99, Math.floor(fraction * 100)), false);
@@ -984,42 +1021,48 @@ function rowsForNotify(rows) {
 }
 
 function announceTransfers(rows) {
-  const address = state.meta?.address || "";
-  const hashes = new Set();
-  let maxBlock = 0;
+  const groups = new Map();
   for (const row of rows) {
-    if (row.hash) hashes.add(row.hash);
-    const block = Number(row.block) || 0;
-    if (block > maxBlock) maxBlock = block;
+    const key = (row.wallet || state.meta?.address || "").toLowerCase();
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
   }
-  const sameWallet = state.seenReady && state.seenAddress === address;
-  const previousMax = state.seenMaxBlock;
-  const previous = state.seenHashes;
-  state.seenAddress = address;
-  state.seenHashes = hashes;
-  state.seenMaxBlock = Math.max(previousMax, maxBlock);
-  if (!sameWallet) {
-    state.seenReady = true;
-    state.seenMaxBlock = maxBlock;
-    return;
+  const fresh = [];
+  for (const [key, group] of groups) {
+    const seen = state.seenByWallet[key] || { ready: false, hashes: new Set(), maxBlock: 0 };
+    const hashes = new Set(seen.hashes);
+    let maxBlock = seen.maxBlock;
+    for (const row of group) {
+      if (row.hash) hashes.add(row.hash);
+      const block = Number(row.block) || 0;
+      if (block > maxBlock) maxBlock = block;
+    }
+    const ready = seen.ready;
+    const previous = seen.hashes;
+    const previousMax = seen.maxBlock;
+    state.seenByWallet[key] = { ready: true, hashes, maxBlock };
+    if (!ready) continue;
+    fresh.push(...group.filter((row) => row.hash && !previous.has(row.hash) && (Number(row.block) || 0) >= previousMax));
   }
   if (!state.notify || Notification.permission !== "granted") return;
-  const fresh = rowsForNotify(rows.filter((row) => row.hash && !previous.has(row.hash) && (Number(row.block) || 0) >= previousMax));
-  if (!fresh.length) return;
-  const who = (state.meta?.label || "").trim() || `${address.slice(0, 6)}…${address.slice(-4)}`;
-  const symbols = [...new Set(fresh.map((row) => row.token_symbol).filter(Boolean))].slice(0, 3);
-  const noun = fresh.length === 1 ? "transfer" : "transfers";
+  const notable = rowsForNotify(fresh);
+  if (!notable.length) return;
+  const who = [...new Set(notable.map((row) => (row.wallet_label || "").trim() || shortAddr(row.wallet)).filter(Boolean))].slice(0, 3);
+  const symbols = [...new Set(notable.map((row) => row.token_symbol).filter(Boolean))].slice(0, 3);
+  const freshCount = notable.length;
+  const noun = freshCount === 1 ? "transfer" : "transfers";
   const detail = symbols.length ? ` · ${symbols.join(", ")}` : "";
+  const whoText = who.join(", ") || "a watched wallet";
   let note;
   try {
     note = new Notification("Buyer Tracker", {
-      body: `${fresh.length} new ${noun} for ${who}${detail}`,
+      body: `${freshCount} new ${noun} for ${whoText}${detail}`,
       tag: "buyer-tracker",
       renotify: true,
     });
   } catch {
     note = new Notification("Buyer Tracker", {
-      body: `${fresh.length} new ${noun} for ${who}${detail}`,
+      body: `${freshCount} new ${noun} for ${whoText}${detail}`,
       tag: "buyer-tracker",
     });
   }
@@ -1041,12 +1084,22 @@ async function trackTransfers(event, options = {}) {
       return;
     }
   }
-  const address = addressInput.value.trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
-    showError("Enter a wallet address (0x and 40 hex characters).");
-    return;
+  const enabled = state.wallets.filter((wallet) => wallet.enabled !== false);
+  let targets = enabled;
+  if (!targets.length) {
+    const address = addressInput.value.trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+      showError("Turn on a saved wallet, or enter a wallet address.");
+      return;
+    }
+    targets = [{ address, label: labelInput.value }];
   }
-  const payload = { address, label: labelInput.value, mode: state.mode };
+  const payload = {
+    address: targets[0].address,
+    label: targets[0].label || "",
+    addresses: targets.map((wallet) => wallet.address),
+    mode: state.mode,
+  };
   if (state.mode === "time") {
     payload.start_time = readTime("startTime");
     payload.end_time = readTime("endTime");

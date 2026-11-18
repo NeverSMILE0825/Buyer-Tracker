@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from tracker.db import db
 from tracker.etherscan import EtherscanError, KeyPool
-from tracker.service import require_api_keys, track
+from tracker.service import require_api_keys, track_many
 
 log = logging.getLogger("buyertracker")
 ROOT = Path(__file__).resolve().parent
@@ -77,6 +77,7 @@ class SettingsIn(BaseModel):
 class TrackIn(BaseModel):
     address: str
     label: str = ""
+    addresses: list[str] = Field(default_factory=list)
     mode: Literal["time", "block"]
     start_time: int | None = None
     end_time: int | None = None
@@ -108,13 +109,21 @@ def index() -> FileResponse:
 
 
 @app.get("/api/wallets")
-def list_wallets() -> list[dict[str, str]]:
+def list_wallets() -> list[dict[str, Any]]:
     return db.wallets()
 
 
 @app.post("/api/wallets")
-def save_wallet(body: WalletIn) -> dict[str, str]:
+def save_wallet(body: WalletIn) -> dict[str, Any]:
     return db.save_wallet(body.address, body.label)
+
+
+@app.post("/api/wallets/{address}/enabled")
+def set_wallet_enabled(address: str, body: EnabledIn) -> dict[str, Any]:
+    saved = db.set_wallet_enabled(address, body.enabled)
+    if saved is None:
+        raise HTTPException(status_code=404, detail="Wallet is not saved.")
+    return saved
 
 
 @app.delete("/api/wallets/{address}")
@@ -218,9 +227,10 @@ async def track_route(body: TrackIn, request: Request) -> StreamingResponse:
         async def run() -> None:
             try:
                 client = _pool(request)
-                payload = await track(
+                targets = body.addresses or [body.address]
+                payload = await track_many(
                     client,
-                    body.address,
+                    targets,
                     body.label,
                     body.mode,
                     _seconds(body.start_time),

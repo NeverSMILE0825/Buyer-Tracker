@@ -36,6 +36,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS wallets (
                 address TEXT PRIMARY KEY,
                 label TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -103,46 +104,79 @@ class Database:
             """
         )
         self._ensure_enabled_column()
+        self._ensure_wallet_enabled()
         self._migrate_legacy_key()
         self._conn.commit()
 
-    def wallets(self) -> list[dict[str, str]]:
+    def wallets(self) -> list[dict[str, str | bool]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT address, label FROM wallets ORDER BY COALESCE(NULLIF(label, ''), address) COLLATE NOCASE"
+                """
+                SELECT address, label, enabled FROM wallets
+                ORDER BY enabled DESC, COALESCE(NULLIF(label, ''), address) COLLATE NOCASE
+                """
             ).fetchall()
-        return [{"address": row["address"], "label": row["label"]} for row in rows]
+        return [self._public_wallet(row) for row in rows]
 
-    def get_wallet(self, address: str) -> dict[str, str] | None:
+    def get_wallet(self, address: str) -> dict[str, str | bool] | None:
         key = normalize_address(address)
         with self._lock:
             row = self._conn.execute(
-                "SELECT address, label FROM wallets WHERE address = ?", (key,)
+                "SELECT address, label, enabled FROM wallets WHERE address = ?", (key,)
             ).fetchone()
         if row is None:
             return None
-        return {"address": row["address"], "label": row["label"]}
+        return self._public_wallet(row)
 
-    def save_wallet(self, address: str, label: str) -> dict[str, str]:
+    def save_wallet(self, address: str, label: str) -> dict[str, str | bool]:
         key = normalize_address(address)
         text = clean_label(label)
         now = int(time.time())
         with self._lock:
             existing = self._conn.execute(
-                "SELECT created_at FROM wallets WHERE address = ?", (key,)
+                "SELECT enabled FROM wallets WHERE address = ?", (key,)
             ).fetchone()
             if existing:
                 self._conn.execute(
-                    "UPDATE wallets SET label = ?, updated_at = ? WHERE address = ?",
+                    "UPDATE wallets SET label = ?, enabled = 1, updated_at = ? WHERE address = ?",
                     (text, now, key),
                 )
+                enabled = True
             else:
                 self._conn.execute(
-                    "INSERT INTO wallets (address, label, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    """
+                    INSERT INTO wallets (address, label, enabled, created_at, updated_at)
+                    VALUES (?, ?, 1, ?, ?)
+                    """,
                     (key, text, now, now),
                 )
+                enabled = True
             self._conn.commit()
-        return {"address": key, "label": text}
+        return {"address": key, "label": text, "enabled": enabled}
+
+    def set_wallet_enabled(self, address: str, enabled: bool) -> dict[str, str | bool] | None:
+        key = normalize_address(address)
+        now = int(time.time())
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE wallets SET enabled = ?, updated_at = ? WHERE address = ?",
+                (1 if enabled else 0, now, key),
+            )
+            self._conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            row = self._conn.execute(
+                "SELECT address, label, enabled FROM wallets WHERE address = ?", (key,)
+            ).fetchone()
+        return self._public_wallet(row)
+
+    @staticmethod
+    def _public_wallet(row: sqlite3.Row) -> dict[str, str | bool]:
+        return {
+            "address": row["address"],
+            "label": row["label"],
+            "enabled": bool(row["enabled"]),
+        }
 
     def delete_wallet(self, address: str) -> bool:
         key = normalize_address(address)
@@ -245,6 +279,13 @@ class Database:
         with self._lock:
             self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
             self._conn.commit()
+
+    def _ensure_wallet_enabled(self) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(wallets)")}
+        if "enabled" in columns:
+            return
+        self._conn.execute("ALTER TABLE wallets ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+        self._conn.execute("UPDATE wallets SET enabled = 1")
 
     def _ensure_enabled_column(self) -> None:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(api_keys)")}
