@@ -350,6 +350,17 @@ async function saveKey() {
   await loadKeys();
 }
 
+async function uploadKeys(file) {
+  const text = await file.text();
+  const data = await getJSON("/api/keys/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  $("keyStatus").textContent = data.message;
+  await loadKeys();
+}
+
 function focusKeyForm() {
   const input = $("apiKeyInput");
   input.scrollIntoView({ block: "center" });
@@ -1281,6 +1292,15 @@ function bind() {
   $("addKey").addEventListener("click", focusKeyForm);
   $("saveKeyBtn").addEventListener("click", () => {
     saveKey().catch((error) => {
+      $("keyStatus").textContent = error.message;
+    });
+  });
+  $("uploadKeysBtn").addEventListener("click", () => $("keyFile").click());
+  $("keyFile").addEventListener("change", () => {
+    const file = $("keyFile").files && $("keyFile").files[0];
+    $("keyFile").value = "";
+    if (!file) return;
+    uploadKeys(file).catch((error) => {
       $("keyStatus").textContent = error.message;
     });
   });

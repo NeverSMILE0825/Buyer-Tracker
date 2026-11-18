@@ -14,7 +14,13 @@ from typing import Any
 
 from tracker.cache import merge_spans, row_identity
 from tracker.checksum import normalize_address
-from tracker.formatutil import clean_api_key, clean_label, mask_secret
+from tracker.formatutil import (
+    clean_api_key,
+    clean_label,
+    describe_key_import,
+    mask_secret,
+    parse_api_key_file,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -341,6 +347,40 @@ class Database:
                 "SELECT id, label, key, enabled FROM api_keys WHERE id = ?", (key_id,)
             ).fetchone()
         return self._public_key(row)
+
+    def import_api_keys(self, text: str) -> dict[str, int | str]:
+        if len(text or "") > 200_000:
+            raise ValueError("That file is too large.")
+        entries, invalid = parse_api_key_file(text)
+        if len(entries) > 500:
+            raise ValueError("That file has more than 500 keys.")
+        if not entries:
+            if invalid:
+                raise ValueError("No valid API keys in that file. Put one key on each line.")
+            raise ValueError("No API keys found. Put one key on each line.")
+        added = 0
+        existing = 0
+        now = int(time.time())
+        with self._lock:
+            for secret, label in entries:
+                row = self._conn.execute(
+                    "SELECT id FROM api_keys WHERE key = ?", (secret,)
+                ).fetchone()
+                if row is not None:
+                    existing += 1
+                    continue
+                self._conn.execute(
+                    "INSERT INTO api_keys (label, key, enabled, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+                    (label, secret, now, now),
+                )
+                added += 1
+            self._conn.commit()
+        return {
+            "added": added,
+            "existing": existing,
+            "invalid": invalid,
+            "message": describe_key_import(added, existing, invalid),
+        }
 
     def set_api_key_enabled(self, key_id: int, enabled: bool) -> dict[str, str | int | bool] | None:
         now = int(time.time())

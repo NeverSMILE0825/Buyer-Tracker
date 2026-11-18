@@ -118,6 +118,7 @@ button:focus-visible, input:focus-visible {
   align-items: stretch;
 }
 .wallet.selected .wallet-pick { border-color: var(--brass); background: rgba(224, 177, 90, 0.08); }
+.key-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .key-row { grid-template-columns: minmax(0, 1fr) auto auto; }
 .key-row.off .wallet-name,
 .key-row.off .wallet-sub { color: var(--faint); }

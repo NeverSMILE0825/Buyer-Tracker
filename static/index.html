@@ -35,7 +35,7 @@
 
       <div class="side-head keys-head">
         <h2>API keys</h2>
-        <p>Save an Etherscan key and add a label later. A label is optional. Turn a key on to use it. Enabled keys fetch at the same time.</p>
+        <p>Save an Etherscan key, or upload a text file with one key on each line. A label is optional. Turn a key on to use it. Enabled keys fetch at the same time.</p>
       </div>
       <label class="field">
         <span>Etherscan API key</span>
@@ -46,7 +46,11 @@
         <span>Label <em>optional</em></span>
         <input id="apiLabel" maxlength="80" placeholder="Free tier, paid, …">
       </label>
-      <button type="button" class="ghost" id="saveKeyBtn">Save key</button>
+      <div class="key-actions">
+        <button type="button" class="ghost" id="saveKeyBtn">Save key</button>
+        <button type="button" class="ghost" id="uploadKeysBtn">Upload keys</button>
+        <input id="keyFile" class="sr" type="file" accept=".txt,.csv,text/plain,text/csv" aria-label="API key file">
+      </div>
       <p id="keyEmpty" class="muted">No saved keys yet.</p>
       <ul id="keyList" class="wallet-list"></ul>
       <p id="keyStatus" class="side-status" role="status"></p>

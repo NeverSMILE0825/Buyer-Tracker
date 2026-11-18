@@ -63,6 +63,10 @@ class ApiKeyIn(BaseModel):
     label: str = ""
 
 
+class ApiKeyImportIn(BaseModel):
+    text: str = Field(max_length=200_000)
+
+
 class EnabledIn(BaseModel):
     enabled: bool
 
@@ -158,6 +162,11 @@ def list_keys() -> list[dict[str, Any]]:
 @app.post("/api/keys")
 def save_key(body: ApiKeyIn) -> dict[str, Any]:
     return db.save_api_key(body.key, body.label)
+
+
+@app.post("/api/keys/import")
+def import_keys(body: ApiKeyImportIn) -> dict[str, Any]:
+    return db.import_api_keys(body.text)
 
 
 @app.post("/api/keys/{key_id}/enabled")

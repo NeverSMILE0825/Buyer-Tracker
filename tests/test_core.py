@@ -12,7 +12,15 @@ from tracker.db import Database
 from tracker.cache import REORG_BLOCKS, collect_records, uncovered_spans
 from tracker.etherscan import QueryTimeout, classify, fetch_records, parallel_walk, split_span, walk_records
 from tracker.service import block_fraction
-from tracker.formatutil import clean_label, format_amount, pretty_method, sort_units, token_amount
+from tracker.formatutil import (
+    clean_label,
+    describe_key_import,
+    format_amount,
+    parse_api_key_file,
+    pretty_method,
+    sort_units,
+    token_amount,
+)
 from tracker.labels import V4_CAPABLE_ROUTERS
 
 WALLET = "0x" + "11" * 20
@@ -93,6 +101,31 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(clean_label("  desk  "), "desk")
         with self.assertRaises(ValueError):
             clean_label("x" * 81)
+
+    def test_api_key_file_is_one_key_per_line(self):
+        text = "\n".join([
+            "FirstKey12345678",
+            "",
+            "# comment",
+            "  SecondKey1234567  ",
+            "FirstKey12345678",
+            "not a key",
+            "ThirdKey12345678, Desk",
+            "Spare, FourthKey123456",
+        ])
+        entries, invalid = parse_api_key_file(text)
+        self.assertEqual(invalid, 1)
+        self.assertEqual(
+            entries,
+            [
+                ("FirstKey12345678", ""),
+                ("SecondKey1234567", ""),
+                ("ThirdKey12345678", "Desk"),
+                ("FourthKey123456", "Spare"),
+            ],
+        )
+        self.assertEqual(describe_key_import(2, 1, 1), "Added 2 keys. 1 already saved. Skipped 1 invalid line.")
+        self.assertEqual(describe_key_import(0, 3, 0), "3 keys were already saved.")
 
 
 class ChecksumTests(unittest.TestCase):
@@ -504,6 +537,24 @@ class DatabaseTests(unittest.TestCase):
             self.assertTrue(database.delete_api_key(first["id"]))
             with self.assertRaises(ValueError):
                 database.save_api_key("short", "")
+            database.set_api_key_enabled(second["id"], False)
+            imported = database.import_api_keys("\n".join([
+                "PaidKey12345678",
+                "UploadedKey123456",
+                "",
+                "too short",
+            ]))
+            self.assertEqual(imported["added"], 1)
+            self.assertEqual(imported["existing"], 1)
+            self.assertEqual(imported["invalid"], 1)
+            listed = {item["hint"]: item for item in database.api_keys()}
+            self.assertEqual(listed["Uplo…3456"]["label"], "")
+            self.assertTrue(listed["Uplo…3456"]["enabled"])
+            self.assertEqual(listed["Paid…5678"]["label"], "Paid plan")
+            self.assertFalse(listed["Paid…5678"]["enabled"])
+            self.assertNotIn("UploadedKey123456", json.dumps(database.api_keys()))
+            with self.assertRaises(ValueError):
+                database.import_api_keys("\n\n# nothing\n")
             database._conn.close()
 
     def test_saved_keys_stay_enabled_when_the_column_is_added(self):
